@@ -5,6 +5,7 @@ import tiktoken
 import torch
 import sys
 import random
+import time
 
 config = {
     "dataset": [
@@ -32,6 +33,7 @@ config = {
     "learningRate": 3e-4,
     "numEpoch": 10,
     "batchSize": 16,
+    "trainDataRatio": 0.9
 }
 
 isTraining = True
@@ -72,9 +74,9 @@ class DataLoader:
         self.batchSize = config["batchSize"]
         self.tokenizer = tokenizer
         self.numTokens = 0
-        self.batches = self.loadDataBatch()
+        self.trainBatches, self.valBatches = self.loadDataBatch(config["trainDataRatio"])
 
-    def loadDataBatch(self):
+    def loadDataBatch(self, trainDataRatio):
         # all books concatenated into a single string and split then into chunks
         # of maxWindowSize, each chunk is a (input, target) pair
         dataset = []
@@ -102,15 +104,24 @@ class DataLoader:
             inputBatch = torch.stack(inputBatch)
             targetBatch = torch.stack(targetBatch)
             batches.append((inputBatch, targetBatch))
-        return batches
+
+        # split dataset into training set and validation set
+        random.shuffle(batches)
+        splitIdx = int(len(batches) * trainDataRatio)
+        trainBatches = batches[:splitIdx]
+        valBatches = batches[splitIdx:]
+        return trainBatches, valBatches
 
     def numBatches(self):
-        return len(self.batches)
+        return len(self.trainBatches) + len(self.valBatches)
 
-    def __iter__(self):
+    def getTrainBatches(self):
         # shuffle the dataset every epoch to prevent model from being overfitted
-        random.shuffle(dataset)
-        return iter(self.batches)
+        random.shuffle(self.trainBatches)
+        return self.trainBatches
+
+    def getValBatches(self):
+        return self.valBatches
 
 class Normalization:
     def __init__(self, config):
@@ -324,73 +335,99 @@ class SmallGPT:
         print(f"@@    Dataset Tokens: {self.dataloader.numTokens}")
         print(f"@@    Dataset WindowSize: {self.dataloader.maxWindowSize}")
 
+    @torch.no_grad()
     def nextToken(self, input, temperature=0.9):
-        with torch.no_grad():
-            logits = self.compute(torch.stack([input]))
-            logits = logits[0, -1, :] / temperature
-            probs = torch.softmax(logits, dim=-1)
-            nextTokenId = torch.multinomial(probs, num_samples=1)
-            return nextTokenId.item()
+        logits = self.compute(torch.stack([input]))
+        logits = logits[0, -1, :] / temperature
+        probs = torch.softmax(logits, dim=-1)
+        nextTokenId = torch.multinomial(probs, num_samples=1)
+        return nextTokenId.item()
 
-    def train(self, numEpoch):
+    @torch.no_grad()
+    def validate(self):
+        global isTraining
+        isTraining = False
+        totalLoss = 0.0
+        valBatches = self.dataloader.getValBatches()
+        for (idx, (input, target)) in enumerate(valBatches):
+            input, target = input.to(self.device), target.to(self.device)
+            output = self.compute(input)
+            output = output.view(output.shape[0] * output.shape[1], output.shape[2])
+            target = target.view(target.shape[0] * target.shape[1])
+            loss = functional.cross_entropy(output, target)
+            totalLoss += loss.item()
+        return totalLoss / len(valBatches)
+
+    def train(self):
         global isTraining
         isTraining = True
-        for epoch in range(numEpoch):
-            for (idx, (input, target)) in enumerate(self.dataloader):
-                input, target = input.to(self.device), target.to(self.device)
-                output = self.compute(input)
-                # cross-entrypy loss asks for (numSample, numClass) and (numSample) as input
-                # it means every sample has a prob distribution over all classes as output
-                # and a single class as target
-                # while I have out(batchSize, inputLen(numSample), vocabSize(numClass))
-                # and target(batchSize, inputLen(numSample)), so I need to flatten them
-                # as out(batchSize * inputLen, vocabSize) and target(batchSize * inputLen)
-                output = output.view(output.shape[0] * output.shape[1], output.shape[2])
-                target = target.view(target.shape[0] * target.shape[1])
-                loss = functional.cross_entropy(output, target)
-                print(
-                    f"\r@@ Epoch: {epoch} Progress: {idx/self.dataloader.numBatches()*100:.2f}% Loss: {loss.item():.4f}",
-                    end="",
-                )
-                loss.backward()
-                # prevent the exploding gradient problem
-                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-            # save the model weights
-            self.saveWeights("smallgpt.bin")
-            smallGPT.predict("杨过和小龙女在")
-
+        totalLoss = 0.0
+        trainBatches = self.dataloader.getTrainBatches()
+        for (idx, (input, target)) in enumerate(trainBatches):
+            input, target = input.to(self.device), target.to(self.device)
+            output = self.compute(input)
+            # cross-entrypy loss asks for (numSample, numClass) and (numSample) as input
+            # it means every sample has a prob distribution over all classes as output
+            # and a single class as target
+            # while I have out(batchSize, inputLen(numSample), vocabSize(numClass))
+            # and target(batchSize, inputLen(numSample)), so I need to flatten them
+            # as out(batchSize * inputLen, vocabSize) and target(batchSize * inputLen)
+            output = output.view(output.shape[0] * output.shape[1], output.shape[2])
+            target = target.view(target.shape[0] * target.shape[1])
+            loss = functional.cross_entropy(output, target)
+            totalLoss += loss.item()
+            loss.backward()
+            # prevent the exploding gradient problem
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+        return totalLoss / len(trainBatches)
+    
+    @torch.no_grad()
     def predict(self, text, maxTokens=30):
         global isTraining
         isTraining = False
         print(f"@@ Input: {text}")
         tokenIds = self.tokenizer.encode(text)
-        with torch.no_grad():
-            for _ in range(maxTokens):
-                window = tokenIds[-self.maxWindowSize() :]
-                t = self.nextToken(
-                    torch.tensor(window, dtype=torch.long, device=self.device)
-                )
-                tokenIds.append(t)
+        for _ in range(maxTokens):
+            window = tokenIds[-self.dataloader.maxWindowSize:]
+            t = self.nextToken(
+                torch.tensor(window, dtype=torch.long, device=self.device)
+            )
+            tokenIds.append(t)
         print(f"@@ Output: {self.tokenizer.decode(tokenIds)}")
 
+
+def train(model, numEpoch):
+    for epoch in range(numEpoch):
+        # train the model and return last training loss
+        start = time.time()
+        avgTrainLoss = model.train()
+        model.saveWeights("smallgpt.bin")
+        # validate the model and return average loss
+        avgValLoss = model.validate()
+        end = time.time()
+        print(f"\r@@ Epoch: {epoch} Elapsed: {end-start:.2f}s TrainLoss: {avgTrainLoss:.4f} ValLoss: {avgValLoss:.4f}\n", end="", flush=True)
+        model.predict("杨过和小龙女在")
+
+def predict(model):
+    model.loadWeights("smallgpt.bin")
+    model.predict("杨过和小龙女在")
+    model.predict("神雕大侠")
+    model.predict("韦小宝和双儿")
+    model.predict("围攻光明顶")
+    model.predict("郭靖和黄蓉")
+    model.predict("张无忌")
+    model.predict("令狐冲说")
+    model.predict("华山论剑")
+    model.predict("桃花岛上")
+    model.predict("少林寺")
+    model.predict("降龙十八掌")
 
 smallGPT = SmallGPT(config)
 
 if len(sys.argv) > 1 and sys.argv[1] == "train":
     smallGPT.printConfig()
-    smallGPT.train(config["numEpoch"])
+    train(smallGPT, config["numEpoch"])
 else:
-    smallGPT.loadWeights("smallgpt.bin")
-    smallGPT.predict("杨过和小龙女在")
-    smallGPT.predict("神雕大侠")
-    smallGPT.predict("韦小宝和双儿")
-    smallGPT.predict("围攻光明顶")
-    smallGPT.predict("郭靖和黄蓉")
-    smallGPT.predict("张无忌")
-    smallGPT.predict("令狐冲说")
-    smallGPT.predict("华山论剑")
-    smallGPT.predict("桃花岛上")
-    smallGPT.predict("少林寺")
-    smallGPT.predict("降龙十八掌")
+    predict(smallGPT)
