@@ -3,28 +3,10 @@ from tokenizers import Tokenizer
 from torch.nn import functional as functional
 import tiktoken
 import torch
-import sys
-import random
-import time
+import glob, os, time, random, sys
 
 config = {
-    "dataset": [
-        "data/金庸-书剑恩仇录txt精校版.txt",
-        "data/金庸-侠客行txt全本精校版.txt",
-        "data/金庸-倚天屠龙记txt精校版.txt",
-        "data/金庸-天龙八部txt精校版.txt",
-        "data/金庸-射雕英雄传txt精校版.txt",
-        "data/金庸-白马啸西风txt精校版.txt",
-        "data/金庸-碧血剑txt精校版.txt",
-        "data/金庸-神雕侠侣txt精校版.txt",
-        "data/金庸-笑傲江湖txt精校版.txt",
-        "data/金庸-越女剑txt精校版.txt",
-        "data/金庸-连城诀txt精校版.txt",
-        "data/金庸-雪山飞狐txt精校版.txt",
-        "data/金庸-飞狐外传txt精校版.txt",
-        "data/金庸-鸳鸯刀txt精校版.txt",
-        "data/金庸-鹿鼎记txt精校版.txt",
-    ],
+    "dataset": "data/small", # Jinyong's 15 novels
     "dimEmb": 512,
     "numLayer": 8,
     "numHead": 8,
@@ -80,7 +62,8 @@ class DataLoader:
         # all books concatenated into a single string and split then into chunks
         # of maxWindowSize, each chunk is a (input, target) pair
         dataset = []
-        for path in config["dataset"]:
+        files = glob.glob(os.path.join(config["dataset"], "*.txt"))
+        for path in files:
             with open(path, "r", encoding="utf-8") as f:
                 tokens = torch.tensor(self.tokenizer.encode(f.read()))
                 self.numTokens += len(tokens)
@@ -328,7 +311,7 @@ class SmallGPT:
         print(f"@@ SmallGPT Configuration:")
         print(f"@@    Device: {self.device}")
         print(f"@@    Model Parameters: {totalParams}")
-        print(f"@@    Model Memory Usage: {totalParams * 4 / 1024 / 1024:.2f} MB")
+        print(f"@@    Model Config: {config}")
         print(f"@@    Tokenizer: {self.tokenizer.__class__.__name__}")
         print(f"@@    Tokenizer VocabSize: {self.tokenizer.vocabSize()}")
         print(f"@@    Dataset Batches: {self.dataloader.numBatches()}")

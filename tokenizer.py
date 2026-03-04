@@ -1,34 +1,21 @@
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
-from tokenizers.pre_tokenizers import Whitespace, Digits, Punctuation, Sequence
-import sys
+from tokenizers.pre_tokenizers import Whitespace, Punctuation, Sequence
+import glob, os, sys
 
 tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
 tokenizer.pre_tokenizer = Sequence([Whitespace(), Punctuation()])
 trainer = BpeTrainer(
-    vocab_size=20000, special_tokens=["[UNK]", "[PAD]", "[CLS]", "[SEP]", "[MASK]"]
+    vocab_size=20000,
+    special_tokens=["[UNK]", "[PAD]", "[CLS]", "[SEP]", "[MASK]", "<|endofbook|>"],
 )
 
 
 def trainTokenizer():
-    files = [
-        "data/金庸-书剑恩仇录txt精校版.txt",
-        "data/金庸-侠客行txt全本精校版.txt",
-        "data/金庸-倚天屠龙记txt精校版.txt",
-        "data/金庸-天龙八部txt精校版.txt",
-        "data/金庸-射雕英雄传txt精校版.txt",
-        "data/金庸-白马啸西风txt精校版.txt",
-        "data/金庸-碧血剑txt精校版.txt",
-        "data/金庸-神雕侠侣txt精校版.txt",
-        "data/金庸-笑傲江湖txt精校版.txt",
-        "data/金庸-越女剑txt精校版.txt",
-        "data/金庸-连城诀txt精校版.txt",
-        "data/金庸-雪山飞狐txt精校版.txt",
-        "data/金庸-飞狐外传txt精校版.txt",
-        "data/金庸-鸳鸯刀txt精校版.txt",
-        "data/金庸-鹿鼎记txt精校版.txt",
-    ]
+    dataDir = "data/small"
+    files = glob.glob(os.path.join(dataDir, "*.txt"))
+    print(f"Training tokenizer with {files} files")
     tokenizer.train(files, trainer)
     path = "data/tokenizer.json"
     tokenizer.save(path)
