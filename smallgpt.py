@@ -15,7 +15,9 @@ config = {
     "learningRate": 3e-4,
     "numEpoch": 10,
     "batchSize": 32,
-    "trainDataRatio": 0.9
+    "trainDataRatio": 0.9,
+    "temperature": 0.9,
+    "topP": 0.9
 }
 
 isTraining = True
@@ -179,8 +181,8 @@ class Attention:
         self.wValue.to(device)
         self.wOut.to(device)
         self.dropout.to(device)
-        self.cos.to(device)
-        self.sin.to(device)
+        self.cos = self.cos.to(device)
+        self.sin =self.sin.to(device)
     
     def applyRoPE(self, q, k, inputLen):
         # q and k are (batchSize, numHead, inputLen, dimHead)
@@ -284,6 +286,7 @@ class SmallGPT:
     def __init__(self, config):
         torch.manual_seed(0xCAFEBABE)
         dimEmb = config["dimEmb"]
+        self.config = config
         self.device = torch.device(
             "cuda"
             if torch.cuda.is_available()
@@ -355,10 +358,31 @@ class SmallGPT:
         print(f"@@    Dataset Tokens: {self.dataloader.numTokens}")
         print(f"@@    Dataset WindowSize: {self.dataloader.maxWindowSize}")
 
+    def topP(self, logits, topP=0.9):
+        logits, idx = torch.sort(logits, descending=True)
+        # [0.5,0.3,0.1,0.1]
+        probs = torch.softmax(logits, dim=-1)
+        # [0.5,0.8,0.9,1.0] if topP=0.85
+        cum = torch.cumsum(probs, dim=-1)
+        # [False, False, True, True]
+        removeMask = cum > self.config["topP"]
+        # keep the first token that makes cumulative probability exceed topP.
+        # e.g., keep 0.1 so (0.5+0.3+0.1) >= 0.85
+        removeMask[1:] = removeMask[:-1].clone()
+        # keep at least one token in case of all tokens are removed
+        removeMask[0] = False
+        masked = logits.masked_fill(removeMask, -torch.inf)
+        filtered = logits.clone()
+        filtered.fill_(-torch.inf)
+        filtered.scatter_(dim=-1, index=idx, src=masked)
+        return filtered
+
     @torch.no_grad()
-    def nextToken(self, input, temperature=0.9):
+    def nextToken(self, input):
         logits = self.compute(torch.stack([input]))
-        logits = logits[0, -1, :] / temperature
+        # first batch, last tokens, all logits
+        logits = logits[0, -1, :] / self.config["temperature"]
+        logits = self.topP(logits)
         probs = torch.softmax(logits, dim=-1)
         nextTokenId = torch.multinomial(probs, num_samples=1)
         return nextTokenId.item()
