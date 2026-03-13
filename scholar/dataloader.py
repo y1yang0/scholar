@@ -15,6 +15,7 @@ class StreamDataLoader:
         self.numTokens = 0
         self.fileIdx = 0
         self.filePos = 0
+        self.endOfTextId, _ = tokenizer.endOfText()
 
     def packToBatch(self, chunks):
         # pack the dataset into smaller batches, i.e.
@@ -46,11 +47,12 @@ class StreamDataLoader:
         for i, file in enumerate(self.files):
             self.fileIdx = i
             size = os.path.getsize(file)
-            print(f"@@ Loading {file}({i}/{len(self.files)})")
+            print(f"@@ Loading... {i}/{len(self.files)}")
             with open(file, "r", encoding="utf-8") as f:
                 while True:
                     t = self.read(f)
                     if not t:  # end of file, stop reading
+                        tokenBuf.append(self.endOfTextId)
                         break
                     self.filePos = (f.tell() / size) * 100.0
                     tokenBuf.extend(self.tokenizer.encode(t))

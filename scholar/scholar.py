@@ -7,12 +7,12 @@ import time
 import sys
 import os
 import math
+import json
 
-isTraining = True
-isDebug = False
-inspector = util.Inspector()
+IsDebug = False
+Inspector = util.Inspector()
 
-sentences = [
+Sentences = [
     "杨过和小龙女在",
     "神雕大侠",
     "韦小宝和双儿",
@@ -42,17 +42,17 @@ def createModelConfig():
     config = {
         "dataset": [
             "data/small",
-            "data/extend",
+            "data/extend"
         ],
-        "dimEmb": 384,
-        "dimFFN": int(4 * 384),  # int(2 / 3 * 4 * 384)
-        "numLayer": 18,
-        "numHead": 6,
+        "dimEmb": 640,
+        "dimFFN": int(4 * 640),  # int(2 / 3 * 4 * 384)
+        "numLayer": 16,
+        "numHead": 10,
         "maxWindowSize": 768,
         "dropoutRate": 0.3,
         "peakLR": 3e-4,
         "minLR": 3e-5,
-        "numEpoch": 12,
+        "numEpoch": 3,
         "batchSize": 16,
         "trainDataRatio": 0.90,
         "temperature": 0.7,
@@ -62,56 +62,42 @@ def createModelConfig():
     return config
 
 
-class Normalization:
+class Normalization(torch.nn.Module):
     def __init__(self, config):
+        super().__init__()
         self.norm = torch.nn.RMSNorm(config["dimEmb"])
 
-    def compute(self, x):
+    def forward(self, x):
         return self.norm(x)
 
-    def to(self, device):
-        self.norm.to(device)
 
-    def parameters(self):
-        return list(self.norm.parameters())
-
-
-class FeedForward:
+class FeedForward(torch.nn.Module):
     def __init__(self, config):
+        super().__init__()
         dimEmb = config["dimEmb"]
         dimFFN = config["dimFFN"]
+        numLayer = config["numLayer"]
         self.wGate = torch.nn.Linear(dimEmb, dimFFN, bias=False)
         self.wValue = torch.nn.Linear(dimEmb, dimFFN, bias=False)
         self.wOut = torch.nn.Linear(dimFFN, dimEmb, bias=False)
+        std = 0.02 / math.sqrt(2 * numLayer)
+        torch.nn.init.normal_(self.wOut.weight, mean=0.0, std=std)
         self.dropout = torch.nn.Dropout(config["dropoutRate"])
 
-    def compute(self, x):
+    def forward(self, x):
         # SwiGLU(x) = (SiLU(x @ wGate) * x @ wValue) @ wOut
         # SiLU(x @ wGate) computes the 0~1 gate value to control how much
         # features from (x @ wValue) should be extracted and wOut projects
         # weighted features to real knowledge
         x = torch.nn.functional.silu(self.wGate(x)) * self.wValue(x)
-        if isTraining:
-            x = self.dropout(x)
-        return self.wOut(x)
-
-    def to(self, device):
-        self.wGate.to(device)
-        self.wValue.to(device)
-        self.wOut.to(device)
-        self.dropout.to(device)
-
-    def parameters(self):
-        return (
-            list(self.wGate.parameters())
-            + list(self.wValue.parameters())
-            + list(self.wOut.parameters())
-        )
+        return self.wOut(self.dropout(x))
 
 
-class Attention:
+class Attention(torch.nn.Module):
     def __init__(self, config, cos, sin):
+        super().__init__()
         dimEmb = config["dimEmb"]
+        numLayer = config["numLayer"]
         self.numHead = config["numHead"]
         self.dropoutRate = config["dropoutRate"]
         # Use Kaiming initialization for better convergence
@@ -119,25 +105,11 @@ class Attention:
         self.wKey = torch.nn.Linear(dimEmb, dimEmb, bias=False)
         self.wValue = torch.nn.Linear(dimEmb, dimEmb, bias=False)
         self.wOut = torch.nn.Linear(dimEmb, dimEmb, bias=False)
+        std = 0.02 / math.sqrt(2 * numLayer)
+        torch.nn.init.normal_(self.wOut.weight, mean=0.0, std=std)
         self.dropout = torch.nn.Dropout(self.dropoutRate)
-        self.cos, self.sin = cos, sin
-
-    def parameters(self):
-        return (
-            list(self.wQuery.parameters())
-            + list(self.wKey.parameters())
-            + list(self.wValue.parameters())
-            + list(self.wOut.parameters())
-        )
-
-    def to(self, device):
-        self.wQuery.to(device)
-        self.wKey.to(device)
-        self.wValue.to(device)
-        self.wOut.to(device)
-        self.dropout.to(device)
-        self.cos = self.cos.to(device)
-        self.sin = self.sin.to(device)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
 
     def applyRoPE(self, q, k, inputLen):
         # q and k are (batchSize, numHead, inputLen, dimHead)
@@ -170,7 +142,7 @@ class Attention:
         # components, I realize that building a functional version of Flash
         # Attention is a massive undertaking. To accelerate the pre-training
         # process, I’ve decided to leverage torch's SPDA
-        dropoutRate = self.dropoutRate if isTraining else 0.0
+        dropoutRate = self.dropoutRate if self.training else 0.0
         out = torch.nn.functional.scaled_dot_product_attention(
             queries, keys, values, attn_mask=None, dropout_p=dropoutRate, is_causal=True
         )
@@ -178,7 +150,7 @@ class Attention:
         out = out.transpose(1, 2).contiguous().view(batchSize, inputLen, dimEmb)
         return self.wOut(out)
 
-    def compute(self, x):
+    def forward(self, x):
         # compute Q,K,V at once, they are in shape of [batchSize, dimEmb, dimEmb]
         query = self.wQuery(x)
         key = self.wKey(x)
@@ -212,8 +184,7 @@ class Attention:
         # apply softmax to get the attention weights
         attnWeights = torch.softmax(attnScore, dim=-1)
         # apply dropout to prevent overfitting
-        if isTraining:
-            attnWeights = self.dropout(attnWeights)
+        attnWeights = self.dropout(attnWeights)
         # apply weights to the values to get the output
         #   attnWeights(batchSize, numHead, inputLen, inputLen) @ V(batchSize, numHead, inputLen, dimHead)
         #   = out(batchSize, numHead, inputLen, dimHead)
@@ -226,38 +197,26 @@ class Attention:
         return self.wOut(out)
 
 
-class Transformer:
+class Transformer(torch.nn.Module):
     def __init__(self, idx, config, cos, sin):
+        super().__init__()
         self.idx = idx
         self.attn = Attention(config, cos, sin)
         self.norm1 = Normalization(config)
         self.norm2 = Normalization(config)
         self.ffn = FeedForward(config)
 
-    def compute(self, x):
-        x = x + self.attn.compute(self.norm1.compute(x))
-        inspector.trace(f"Attn#{self.idx}", x) if isDebug else None
-        x = x + self.ffn.compute(self.norm2.compute(x))
-        inspector.trace(f"FFN#{self.idx}", x) if isDebug else None
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        Inspector.trace(f"Attn#{self.idx}", x) if IsDebug else None
+        x = x + self.ffn(self.norm2(x))
+        Inspector.trace(f"FFN#{self.idx}", x) if IsDebug else None
         return x
 
-    def to(self, device):
-        self.attn.to(device)
-        self.norm1.to(device)
-        self.norm2.to(device)
-        self.ffn.to(device)
 
-    def parameters(self):
-        return (
-            self.attn.parameters()
-            + self.norm1.parameters()
-            + self.norm2.parameters()
-            + self.ffn.parameters()
-        )
-
-
-class Model:
+class Model(torch.nn.Module):
     def __init__(self, config, tokenizer):
+        super().__init__()
         torch.manual_seed(0xCAFEBABE)
         torch.set_float32_matmul_precision("high")
         dimEmb = config["dimEmb"]
@@ -269,18 +228,18 @@ class Model:
         self.device = util.getTorchDevice()
         self.tokenEmbedding = torch.nn.Embedding(self.vocabSize, dimEmb)
         cos, sin = self.initRoPE(config["maxWindowSize"], dimHead)
-        self.transformers = [
-            Transformer(idx, config, cos, sin) for idx in range(config["numLayer"])
-        ]
+        self.transformers = torch.nn.ModuleList(
+            [Transformer(idx, config, cos, sin) for idx in range(config["numLayer"])]
+        )
         self.finalNorm = Normalization(config)
         self.out = torch.nn.Linear(
             dimEmb, self.vocabSize, bias=False
         )  # no weight tying
+        self.to(self.device)
         self.optimizer = torch.optim.AdamW(
             self.parameters(), lr=config["peakLR"], fused=util.cudaAvailable()
         )
         self.scheduler = None
-        self.to(self.device)
         self.gradNorm = None
 
     def setupScheduler(self, totalSteps):
@@ -300,22 +259,6 @@ class Model:
             milestones=[warmupSteps],
         )
 
-    def parameters(self):
-        params = list(self.tokenEmbedding.parameters())
-        for t in self.transformers:
-            params += t.parameters()
-        params += self.finalNorm.parameters()
-        params += list(self.out.parameters())
-        return params
-
-    def to(self, device):
-        self.device = device
-        self.tokenEmbedding.to(device)
-        for t in self.transformers:
-            t.to(device)
-        self.finalNorm.to(device)
-        self.out.to(device)
-
     def initRoPE(self, maxWindowSize, dimHead):
         # freq = 10000 ^ (-2 * i / dimHead), where i is in [0, 1,..., dimHead//2]
         i = torch.arange(start=0, end=dimHead // 2, device=self.device)
@@ -326,18 +269,15 @@ class Model:
         cos = torch.cos(theta)
         return cos, sin
 
-    # @torch.compile
-    def compute(self, input):
-        input = input.to(self.device)
+    def forward(self, input):
         x = self.tokenEmbedding(input)
         for transformer in self.transformers:
-            x = transformer.compute(x)
-        x = self.finalNorm.compute(x)
-        inspector.trace("FinalNorm", x) if isDebug else None
+            x = transformer(x)
+        x = self.finalNorm(x)
+        Inspector.trace("FinalNorm", x) if IsDebug else None
         return self.out(x)
 
     def loss(self, output, target):
-        target = target.to(self.device)
         # cross-entrypy loss asks for (numSample, numClass) and (numSample) as input
         # it means every sample has a prob distribution over all classes as output
         # and a single class as target
@@ -358,14 +298,21 @@ class Model:
         self.scheduler.step()
 
     def saveWeights(self, path):
-        self.optimizer.state_dict
-        torch.save([p.data.cpu() for p in self.parameters()], path)
+        torch.save(
+            {
+                "model": self.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "scheduler": self.scheduler.state_dict(),
+            },
+            path,
+        )
         util.log({"msg": f"Model saved to {path}"})
 
     def loadWeights(self, path):
-        state = torch.load(path, weights_only=True, map_location=self.device)
-        for p, data in zip(self.parameters(), state):
-            p.data.copy_(data)
+        data = torch.load(path, weights_only=False, map_location=self.device)
+        self.load_state_dict(data["model"])
+        self.optimizer.load_state_dict(data["optimizer"])
+        self.scheduler.load_state_dict(data["scheduler"]) if self.scheduler else None
         util.log({"msg": f"Model loaded from {path}"})
 
     def topP(self, logits):
@@ -403,10 +350,12 @@ class Model:
         # this is not strictly necessary because we have RoPE after all
         tokens = tokens[-self.config["maxWindowSize"] :]
         numInitTokens = len(tokens)
-        for _ in range(numNextToken):
-            inspector.start(self.tokenizer, tokens, self.out)
+        for i in range(numNextToken):
+            if i == numNextToken - 1:
+                # only trace last token generation
+                Inspector.start(self.tokenizer, tokens, self.out)
             t = torch.tensor(tokens, dtype=torch.long, device=self.device)
-            logits = self.compute(torch.stack([t]))
+            logits = self.forward(torch.stack([t]))
             # first batch, last tokens, all logits
             logits = logits[0, -1, :]
             # find recently generated tokens and avoid repeating them
@@ -440,6 +389,7 @@ class Scholar:
             {
                 "event": "config",
                 "bf16": torch.cuda.is_bf16_supported(),
+                "flashAttn": torch.backends.cuda.flash_sdp_enabled(),
                 "device": str(self.model.device),
                 "vocabSize": self.tokenizer.vocabSize(),
                 "params": totalParams,
@@ -461,12 +411,11 @@ class Scholar:
             )
         if self.totalBatch % 100 == 0:
             # do real text generation
-            global isTraining
-            isTraining = False
-            for i, sentence in enumerate(sentences):
+            self.model.eval()
+            for i, sentence in enumerate(Sentences):
                 output = self.model.nextToken(sentence, numNextToken=20)
                 util.log({"idx": i, "input": sentence, "output": output})
-            isTraining = True
+            self.model.train()
             # validate the model performance on validation set
             avgValLoss = self.validate()
             util.log(
@@ -485,51 +434,58 @@ class Scholar:
 
     @torch.no_grad()
     def validate(self):
-        global isTraining
-        isTraining = False
+        self.model.eval()
         totalLoss = 0.0
         totalBatch = 0
         for input, target in self.dataloader.nextValBatch():
+            input = input.to(self.model.device, non_blocking=True)
+            target = target.to(self.model.device, non_blocking=True)
             # compute loss without updating weights
             with torch.autocast(
                 device_type=self.model.device.type,
                 dtype=torch.bfloat16,
                 enabled=torch.cuda.is_bf16_supported(),
             ):
-                output = self.model.compute(input)
+                output = self.model.forward(input)
                 loss = self.model.loss(output, target)
             totalLoss += loss.item()
             totalBatch += 1
         return totalLoss / totalBatch
 
-    def bootTrain(self):
+    def bootTrain(self, resume):
         # use simple data loader to load Jinyong's novels all at once
         # it should be replaced with large data loader for streaming
         maxEpoch = self.config["numEpoch"]
         dataset = self.config["dataset"]
-        files = util.listFiles(dataset)
+        files = util.listFiles(dataset, ".txt")
         # self.dataloader = dataloader.LargeDataLoader(self.config, self.tokenizer, files)
         self.dataloader = dataloader.SimpleDataLoader(
             self.config, self.tokenizer, files
         )
         self.model.setupScheduler(self.dataloader.totalTrainBatches() * maxEpoch)
+        if resume != "":
+            self.model.loadWeights(resume)
+        self.model = (
+            torch.compile(self.model) if sys.platform != "win32" else self.model
+        )
         self.logConfig()
 
     def trainStep(self, input, target):
-        global isTraining
-        isTraining = True
+        self.model.train()
+        input = input.to(self.model.device, non_blocking=True)
+        target = target.to(self.model.device, non_blocking=True)
         with torch.autocast(
             device_type=self.model.device.type,
             dtype=torch.bfloat16,
             enabled=torch.cuda.is_bf16_supported(),
         ):
-            output = self.model.compute(input)
+            output = self.model.forward(input)
             loss = self.model.loss(output, target)
         loss.backward()
         return loss
 
-    def train(self):
-        self.bootTrain()
+    def train(self, resume=""):
+        self.bootTrain(resume)
         print(f"@@ Training...")
         for epoch in range(self.config["numEpoch"]):
             epochStart = time.time()
@@ -547,14 +503,12 @@ class Scholar:
         self.train()
 
     @torch.no_grad()
-    def predict(self, sentences, numNextToken=50):
-        global isTraining
-        isTraining = False
+    def predict(self, sentence, numNextToken=50):
+        self.model.eval()
         self.model.loadWeights("scholar_last.bin")
         pairs = []
-        for sentence in sentences:
-            output = self.model.nextToken(sentence, numNextToken)
-            pairs.append((sentence, output))
+        output = self.model.nextToken(sentence, numNextToken)
+        pairs.append((sentence, output))
         return pairs
 
 
@@ -564,17 +518,22 @@ if __name__ == "__main__":
         util.log({"event": "start", "mode": mode, "timestamp": time.time()})
         g = Scholar(createModelConfig())
         if mode == "train":
-            g.train()
+            resume = "" if len(sys.argv) <= 2 else sys.argv[2]
+            g.train(resume)
+            util.log({"event": "end", "timestamp": time.time()})
         elif mode == "predict":
-            for sentence, output in g.predict(sentences):
-                print(f"@@ Predict: {sentence}[{output}]")
+            sentences = sys.argv[2]
+            response = g.predict(sentences)
+            json.dump(response, sys.stdout, ensure_ascii=False)
         elif mode == "tuning":
             g.tuning()
         elif mode == "debug":
             sentence = "过儿"
-            isDebug = True
+            IsDebug = True
             print(f"@@ DebugInput: {sentence}")
             [(_, output)] = g.predict([sentence], numNextToken=1)
             print(f"@@ DebugOutput: {output}")
     else:
-        print("Usage: python scholar.py <train|predict|tuning|debug>")
+        print("       python scholar.py train [resume.bin]")
+        print('Usage: python scholar.py predict "杨过跳了下去，发现"')
+        print("       python scholar.py debug")

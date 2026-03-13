@@ -1,16 +1,22 @@
 # Copyright (c) 2026 yyang. All rights reserved.
 import sys
+import os
+from torch import special
 import util
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 import scholar
+import pathlib
 
-eot = "<|endoftext|>"
+EOT = "<|endoftext|>"
+TrainedTokenizerFile = "tokenizer.json"
+MaxVocabSize = 25000
+ScriptDir = pathlib.Path(__file__).parent
 
 
 # Self-trained tokenizer for Jinyong-specific dataset, from huggingface/tokenizer
 class BBPETokenizer:
     def __init__(self):
-        path = "scholar/tokenizer.json"
+        path = str(ScriptDir / TrainedTokenizerFile)
         self.tokenizer = Tokenizer.from_file(path)
 
     def decode(self, ids):
@@ -24,31 +30,41 @@ class BBPETokenizer:
 
     def endOfText(self):
         # eot is guaranteed to be ONE special token
-        return (self.encode(eot)[0], eot)
+        return (self.encode(EOT)[0], EOT)
 
+def createSpecialTokens(files):
+    specialTokens = []
+    for file in files:
+        name = os.path.basename(file).split(".")[0]
+        specialTokens.append(f"<|{name}|>")
+    return specialTokens
 
 def trainTokenizer():
-    files = util.listFiles(scholar.createModelConfig()["dataset"])
-    print(f"@@ Training tokenizer with {files} files")
+    files = util.listFiles(
+        scholar.createModelConfig()["dataset"], ".txt", []
+    )
+    print(f"@@ Training tokenizer with {len(files)} files")
     tokenizer = Tokenizer(models.BPE())
-
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tokenizer.decoder = decoders.ByteLevel()
-
+    vocabSize = MaxVocabSize + (64 - MaxVocabSize % 64)
+    specialTokens = ["<|pad|>", "<|cls|>", "<|sep|>", "<|mask|>", EOT]
+    specialTokens = specialTokens + createSpecialTokens(files)
+    print(f"@@ Special tokens: {specialTokens}")
     trainer = trainers.BpeTrainer(
-        vocab_size=20000,
-        special_tokens=["[PAD]", "[CLS]", "[SEP]", "[MASK]", eot],
+        vocab_size=vocabSize,
+        special_tokens=specialTokens,
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
     )
 
     tokenizer.train(files, trainer)
-    path = "scholar/tokenizer.json"
+    path = str(ScriptDir / TrainedTokenizerFile)
     tokenizer.save(path)
     print(f"@@ Save tokenizer to {path}")
 
 
 def testTokenizer():
-    path = "scholar/tokenizer.json"
+    path = str(ScriptDir / TrainedTokenizerFile)
     tokenizer = Tokenizer.from_file(path)
     sentences = [
         "杨过",

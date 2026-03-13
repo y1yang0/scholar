@@ -16,19 +16,28 @@ def cudaAvailable():
     return torch.cuda.is_available()
 
 
-def log(kvals):
+def log(kvals, file="train.log"):
     data = json.dumps(kvals, ensure_ascii=False)
-    with open("debug.log", "a", encoding="utf-8") as f:
+    with open(file, "a", encoding="utf-8") as f:
         f.write(data + "\n")
 
 
-def listFiles(dirs):
+def listFiles(dirs, includes=".txt", exclude=[]):
     allFiles = []
     for d in dirs:
         for root, _, files in os.walk(d):
             for file in files:
-                filePath = os.path.join(root, file)
-                allFiles.append(filePath)
+                if len(exclude) >0:
+                    shouldExclude = False
+                    for e in exclude:
+                        if file.endswith(e):
+                            shouldExclude = True
+                            break
+                    if shouldExclude:
+                        continue
+                if file.endswith(includes):
+                    filePath = os.path.join(root, file)
+                    allFiles.append(filePath)
     return allFiles
 
 
@@ -40,16 +49,23 @@ class Inspector:
     def __init__(self):
         self.inputTokens = []
         self.out = None
+        self.started = False
+        self.file = "inspect.log"
 
     def start(self, tokenizer, inputTokens, out):
         self.inputTokens = inputTokens
         self.out = out
         self.tokenizer = tokenizer
+        if os.path.exists(self.file):
+            os.remove(self.file)
+        self.started = True
 
-    def trace(self, name, x, top=5):
-        # for the given input tokens and intermediate tensor x, find the most
+    def trace(self, name, x, top=15):
+        if not self.started:
+            return
+        # x is in shape of (batchSize, inputLen, dimEmb)
+        # for the given input tokens and intermediate tensor, find the most
         # similar tokens
-        print(f"@@ {name}:")
         for t in range(x.shape[-2]):
             tokenEmbedding = x[0, t, :]
             logits = self.out(tokenEmbedding)
@@ -61,4 +77,6 @@ class Inspector:
                 similar.append(f"{d}({topLogits[k].item():.1f})")
 
             inputToken = self.tokenizer.decode([self.inputTokens[t]])
-            print(f"   {inputToken} {similar}")
+            log(
+                {"layer": name, "inputToken": inputToken, "similar": similar}, self.file
+            )

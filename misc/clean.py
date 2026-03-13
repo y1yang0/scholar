@@ -31,8 +31,7 @@ from dataclasses import dataclass, field
 # 数据目录（相对于项目根目录，支持递归处理）
 DATA_DIRS = [
     # "data/small
-    "data/extend/综合",
-    "data/extend/梁羽生",  # 递归处理所有子目录
+    "data/extend/综合"
 ]
 
 FILE_PATTERN = "*.txt"
@@ -63,6 +62,10 @@ ALLOWED_CHARS = set(
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.,:;!?'\"()[]<>|"
     )
 )
+
+# 排除的问题字符（虽在全角范围但需要报告）
+PROBLEM_CHARS = set("＊")
+ALLOWED_CHARS -= PROBLEM_CHARS
 
 
 # ============================================================================
@@ -632,18 +635,50 @@ class ReportSpecialChars(CleanTask):
 class ReportProblemKeywords(CleanTask):
     """报告高频问题词（不修改文件）"""
 
+    # 章节标题正则（用于排除标题行的文末标记检测）
+    CHAPTER_PATTERN = re.compile(
+        r"^(第[一二三四五六七八九十百千万零\d]+[章卷回节集部篇]|终章|大结局)"
+    )
+
+    # 即使在章节标题行中也要检测的模式（如"第五十二章本卷终"）
+    ALWAYS_DETECT_PATTERNS = [
+        r"本书[完终]",
+        r"本卷[完终]",
+        r"本章[完终]",
+        r"本集[完终]",
+        r"本部[完终]",
+        r"本篇[完终]",
+    ]
+
     # 高频问题词分类定义
     PROBLEM_PATTERNS = {
         "文末标记": [
             r"全文完",
             r"全书完",
             r"正文完",
+            r"本书完",
+            r"本卷完",
+            r"本章完",
+            r"本集完",
+            r"本部完",
+            r"本篇完",
+            r"全书终",
+            r"全文终",
+            r"全剧终",
+            r"^完结$",
+            r"终章",
+            r"大结局",
+            r"第?[一二三四五六七八九十百千万零\d]+[卷章部集篇]终",
+            r"[卷章部集篇][一二三四五六七八九十百千万零\d]+终",
             r"（完）",
             r"\(完\)",
             r"——完——",
             r"==完==",
             r"〔完〕",
             r"\[完\]",
+            r"【完】",
+            r"～完～",
+            r"—完—",
         ],
         "网站水印": [
             r"潇湘书院",
@@ -730,6 +765,18 @@ class ReportProblemKeywords(CleanTask):
     def is_modifier(self) -> bool:
         return False
 
+    def _should_skip_line(self, category: str, line: str) -> bool:
+        """判断是否跳过该行的检测"""
+        if category != "文末标记":
+            return False
+        if not self.CHAPTER_PATTERN.match(line.strip()):
+            return False
+        # 章节标题行，但检查是否包含“总是检测”的模式
+        for pattern in self.ALWAYS_DETECT_PATTERNS:
+            if re.search(pattern, line):
+                return False  # 包含高优先级模式，不跳过
+        return True  # 普通章节标题，跳过
+
     def process(self, content: str, file_path: str) -> Tuple[str, CleanResult]:
         result = CleanResult(file_path=file_path, task_name=self.name)
 
@@ -740,6 +787,9 @@ class ReportProblemKeywords(CleanTask):
             for pattern in patterns:
                 regex = re.compile(pattern, re.IGNORECASE)
                 for line_num, line in enumerate(lines, 1):
+                    # 文末标记类别：根据规则跳过章节标题行
+                    if self._should_skip_line(category, line):
+                        continue
                     for match in regex.finditer(line):
                         if category not in found_problems:
                             found_problems[category] = []
