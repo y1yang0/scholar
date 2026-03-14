@@ -1,22 +1,33 @@
-![](logo.svg)
+<div  align="center">
+<img src="misc/logo.png" width="20%">
 
-SmallGPT is a modernized minimal GPT implementation from scratch for learning purposes.
+**Scholar Etude** - Modernized minimal GPT implementation from scratch.
+</div>
+
+----
 
 **Install dependencies**: 
 ```
-$ pip install -r requirements.txt
-```
-**Train the tokenizer**:
-```
-python tokenizer.py train
+$ pip install -r scholar/requirements.txt
 ```
 
-**Train the model**:
+**Pre-training the model**:
 ```
-python smallgpt.py train
+$ git clone --branch master https://huggingface.co/datasets/y1yang0/scholar-novels-curated data
+$ python scholar/scholar.py train
 ```
 
-**Supervised Fine-tuning**:
+**Generating next few words**:
 ```
-python tuning.py
+$ python scholar/scholar.py predict
 ```
+
+**Inspecting model internals**:
+```
+$ python scholar/scholar.py debug
+```
+
+## Training dashboard
+Running `python misc/draw.py` to run traning monitor
+
+![](misc/dashboard.png)
