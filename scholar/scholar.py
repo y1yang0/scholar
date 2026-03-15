@@ -48,12 +48,13 @@ def createModelConfig():
         "dimFFN": int(4 * 640),  # int(2 / 3 * 4 * 384)
         "numLayer": 16,
         "numHead": 10,
-        "maxWindowSize": 768,
+        "maxWindowSize": 1024,
         "dropoutRate": 0.3,
         "peakLR": 3e-4,
         "minLR": 3e-5,
         "numEpoch": 3,
-        "batchSize": 16,
+        "batchSize": 8,
+        "gradAccumStep": 16,
         "trainDataRatio": 0.90,
         "temperature": 0.7,
         "topP": 0.85,
@@ -379,8 +380,8 @@ class Scholar:
         self.tokenizer = tokenizer.BBPETokenizer()
         self.model = Model(config, self.tokenizer)
         self.dataloader = None
+        self.gradAccumStep = config["gradAccumStep"]
         # training statistics
-        self.totalBatch = 0
         self.bestValLoss = float("inf")
 
     def logConfig(self):
@@ -397,40 +398,35 @@ class Scholar:
             }
         )
 
-    def checkpoint(self, loss):
-        self.totalBatch += 1
-        if self.totalBatch % 50 == 0:
-            currentLR = self.model.optimizer.param_groups[0]["lr"]
-            util.log(
-                {
-                    "batch": self.totalBatch,
-                    "trainLoss": loss.item(),
-                    "gradNorm": self.model.gradNorm.item(),
-                    "currentLR": currentLR,
-                }
-            )
-        if self.totalBatch % 100 == 0:
-            # do real text generation
-            self.model.eval()
-            for i, sentence in enumerate(Sentences):
-                output = self.model.nextToken(sentence, numNextToken=20)
-                util.log({"idx": i, "input": sentence, "output": output})
-            self.model.train()
-            # validate the model performance on validation set
-            avgValLoss = self.validate()
-            util.log(
-                {
-                    "batch": self.totalBatch,
-                    "trainLoss": loss.item(),
-                    "valLoss": avgValLoss,
-                    "trainPPL": math.exp(loss.item()),
-                    "valPPL": math.exp(avgValLoss),
-                }
-            )
-            if avgValLoss < self.bestValLoss:
-                self.model.saveWeights("scholar_best.bin")
-                self.bestValLoss = avgValLoss
-            self.model.saveWeights("scholar_last.bin")
+    def checkpoint(self, stepIdx, trainLoss):
+        if stepIdx %(self.gradAccumStep * 5) != 0:
+            return
+        # do real text generation
+        self.model.eval()
+        for i, sentence in enumerate(Sentences):
+            output = self.model.nextToken(sentence, numNextToken=20)
+            util.log({"idx": i, "input": sentence, "output": output})
+        # validate the model performance
+        valLoss = self.validate()
+        # log critical training statistics
+        gradNorm = self.model.gradNorm.item()
+        currentLR = self.model.optimizer.param_groups[0]["lr"]
+        util.log(
+            {
+                "step": stepIdx,
+                "currentLR": currentLR,
+                "gradNorm": gradNorm,
+                "trainLoss": trainLoss,
+                "valLoss": valLoss,
+                "trainPPL": math.exp(trainLoss),
+                "valPPL": math.exp(valLoss),
+            }
+        )
+        # find best model
+        if valLoss < self.bestValLoss:
+            self.model.saveWeights("scholar_best.bin")
+            self.bestValLoss = valLoss
+        self.model.saveWeights("scholar_last.bin")
 
     @torch.no_grad()
     def validate(self):
@@ -462,7 +458,9 @@ class Scholar:
         self.dataloader = dataloader.SimpleDataLoader(
             self.config, self.tokenizer, files
         )
-        self.model.setupScheduler(self.dataloader.totalTrainBatches() * maxEpoch)
+        epochSteps = self.dataloader.totalTrainBatches()
+        totalSteps = math.ceil(epochSteps*maxEpoch/self.gradAccumStep)
+        self.model.setupScheduler(totalSteps)
         if resume != "":
             self.model.loadWeights(resume)
         self.model = (
@@ -481,20 +479,31 @@ class Scholar:
         ):
             output = self.model.forward(input)
             loss = self.model.loss(output, target)
-        loss.backward()
+        # I update the weights every gradAccumStep steps, so the backward loss
+        # should be scaled as well to compensate for the smaller update frequency
+        lossScaled = loss / self.gradAccumStep
+        lossScaled.backward()
         return loss
 
     def train(self, resume=""):
         self.bootTrain(resume)
         print(f"@@ Training...")
+        stepIdx = 0
+        gradAccumLoss = torch.tensor(0.0, device=self.model.device)
         for epoch in range(self.config["numEpoch"]):
             epochStart = time.time()
             for input, target in self.dataloader.nextTrainBatch():
                 loss = self.trainStep(input, target)
-                self.model.updateWeight()
-                self.checkpoint(loss)
+                # accumulate loss on GPU
+                gradAccumLoss += loss.detach()
+                stepIdx += 1
+                if stepIdx % self.gradAccumStep == 0:
+                    self.model.updateWeight()
+                    trainLoss = (gradAccumLoss / self.gradAccumStep).item()
+                    self.checkpoint(stepIdx, trainLoss)
+                    gradAccumLoss.zero_()
             epochEnd = time.time()
-            self.model.saveWeights("scholar_last.bin")
+            self.saveWeights("scholar_last.bin")
             util.log({"epoch": epoch, "elapsed": epochEnd - epochStart})
 
     def tuning(self):
