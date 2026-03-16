@@ -22,12 +22,12 @@ def log(kvals, file="train.log"):
         f.write(data + "\n")
 
 
-def listFiles(dirs, includes=".txt", exclude=[]):
+def listFiles(dirs, includes="", exclude=[]):
     allFiles = []
     for d in dirs:
         for root, _, files in os.walk(d):
             for file in files:
-                if len(exclude) >0:
+                if len(exclude) > 0:
                     shouldExclude = False
                     for e in exclude:
                         if file.endswith(e):
@@ -35,7 +35,11 @@ def listFiles(dirs, includes=".txt", exclude=[]):
                             break
                     if shouldExclude:
                         continue
-                if file.endswith(includes):
+                if includes != "":
+                    if file.endswith(includes):
+                        filePath = os.path.join(root, file)
+                        allFiles.append(filePath)
+                else:
                     filePath = os.path.join(root, file)
                     allFiles.append(filePath)
     return allFiles

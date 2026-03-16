@@ -192,10 +192,86 @@ class SFTDataLoader:
                     )
                     chunkBuf.append((tokens[:-1], target[1:]))
                     if len(chunkBuf) == self.batchSize:
-                        inputBatch, targetBatch = self.packToBatch(chunkBuf)
+                        inputBatch, targetBatch = packToBatch(chunkBuf)
                         chunkBuf = []
                         yield inputBatch, targetBatch
         # sft data is precious, don't let it go to waste
         if len(chunkBuf) > 0:
-            inputBatch, targetBatch = self.packToBatch(chunkBuf)
+            inputBatch, targetBatch = packToBatch(chunkBuf)
             yield inputBatch, targetBatch
+
+
+class MixedDataLoader:
+    def __init__(self, config, tokenizer):
+        self.config = config
+        self.tokenizer = tokenizer
+        # prepare all kinds of datasets
+        self.novelDataset = datasets.load_dataset(
+            "y1yang0/scholar-novels-curated", split="train"
+        )
+        self.wikiDataset = datasets.load_dataset(
+            "shaowenchen/wiki_zh", split="train[:5%]"
+        )
+        # make sure all datasets have the same format, this is required by the
+        # interleave_datasets function
+        formatData = lambda text: {"text": text["text"]}
+        self.novelDataset = self.novelDataset.map(
+            formatData, remove_columns=self.novelDataset.column_names
+        )
+        self.wikiDataset = self.wikiDataset.map(
+            formatData, remove_columns=self.wikiDataset.column_names
+        )
+        # interleave the wiki and novel dataset with A% wiki and B% novel and etc
+        self.mixedDataset = datasets.interleave_datasets(
+            [self.wikiDataset, self.novelDataset],
+            probabilities=[0.0, 1.0],
+            seed=0xCAFEBABE,
+        )
+        # apply tokenization to the mixed dataset
+        splitDataset = self.mixedDataset.train_test_split(
+            test_size=0.1, seed=0xCAFEBABE
+        )
+        self.trainDataset = splitDataset["train"]
+        self.valDataset = splitDataset["test"]
+
+    def printDataset(self):
+        totalRow = len(self.novelDataset) + len(self.wikiDataset)
+        print("@@ Novel Dataset:")
+        print(self.novelDataset)
+        print(self.novelDataset.features)
+        for i in range(2):
+            print(f"@@    Text Sample {i}: {self.novelDataset[i]['text'][:100]}")
+        print("@@ Wiki Dataset:")
+        print(self.wikiDataset)
+        # for i in range(2):
+        # print(f"@@    TextSample {i}: {self.wikiDataset[i]['text'][:100]}")
+        print(f"@@ Total rows: {totalRow}")
+        print(f"@@ Novel ratio: {len(self.novelDataset)/totalRow*100:.2f}%")
+        print(f"@@ Wiki ratio: {len(self.wikiDataset)/totalRow*100:.2f}%")
+        print(f"@@ Train dataset: {len(self.trainDataset)}")
+        print(f"@@ Val dataset: {len(self.valDataset)}")
+
+
+# def testHFDataset():
+#     dataset = datasets.load_dataset("y1yang0/scholar-novels-curated", split=["train","validation"])
+#     print(dataset)
+#     print(dataset["train"][0])
+#     print(dataset["train"][1])
+#     print(dataset["train"][2])
+#     print(dataset["train"][3])
+#     print(dataset["train"][4])
+#     print(dataset["train"][5])
+#     print(dataset["train"][6])
+#     print(dataset["train"][7])
+#     print(dataset["train"][8])
+#     print(dataset["train"][9])
+
+if __name__ == "__main__":
+    import scholar
+
+    tokenizer = tokenizer.BBPETokenizer()
+    ds = MixedDataLoader(scholar.createModelConfig(), tokenizer)
+    ds.printDataset()
+    idx = 0
+    for textIds in ds.mixedDataset:
+        idx += 1

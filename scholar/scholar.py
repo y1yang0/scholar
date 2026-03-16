@@ -40,10 +40,7 @@ Sentences = [
 
 def createModelConfig():
     config = {
-        "dataset": [
-            "data/small",
-            "data/extend"
-        ],
+        "dataset": ["data/small", "data/extend"],
         "dimEmb": 640,
         "dimFFN": int(4 * 640),  # int(2 / 3 * 4 * 384)
         "numLayer": 16,
@@ -78,8 +75,9 @@ class FeedForward(torch.nn.Module):
         dimEmb = config["dimEmb"]
         dimFFN = config["dimFFN"]
         numLayer = config["numLayer"]
-        self.wGate = torch.nn.Linear(dimEmb, dimFFN, bias=False)
-        self.wValue = torch.nn.Linear(dimEmb, dimFFN, bias=False)
+        assert dimFFN % dimEmb == 0, "sanity check"
+        # similiar to wQKV, merge wGate and wValue into one larger linear
+        self.wGateValue = torch.nn.Linear(dimEmb, dimFFN * 2, bias=False)
         self.wOut = torch.nn.Linear(dimFFN, dimEmb, bias=False)
         std = 0.02 / math.sqrt(2 * numLayer)
         torch.nn.init.normal_(self.wOut.weight, mean=0.0, std=std)
@@ -90,24 +88,28 @@ class FeedForward(torch.nn.Module):
         # SiLU(x @ wGate) computes the 0~1 gate value to control how much
         # features from (x @ wValue) should be extracted and wOut projects
         # weighted features to real knowledge
-        x = torch.nn.functional.silu(self.wGate(x)) * self.wValue(x)
+        # Since (x @ wGate) and (x @ wValue) computes the same input, they can
+        # be merged into one linear computation
+        gv = self.wGateValue(x)
+        wGate, wValue = gv.chunk(2, dim=-1)
+        x = torch.nn.functional.silu(wGate) * wValue
         return self.wOut(self.dropout(x))
 
 
 class Attention(torch.nn.Module):
     def __init__(self, config, cos, sin):
         super().__init__()
-        dimEmb = config["dimEmb"]
         numLayer = config["numLayer"]
+        self.dimEmb = config["dimEmb"]
         self.numHead = config["numHead"]
+        assert self.dimEmb % self.numHead == 0, "sanity check"
         self.dropoutRate = config["dropoutRate"]
-        # Use Kaiming initialization for better convergence
-        self.wQuery = torch.nn.Linear(dimEmb, dimEmb, bias=False)
-        self.wKey = torch.nn.Linear(dimEmb, dimEmb, bias=False)
-        self.wValue = torch.nn.Linear(dimEmb, dimEmb, bias=False)
-        self.wOut = torch.nn.Linear(dimEmb, dimEmb, bias=False)
+        # Use Kaiming initialization(Linear by default) for better convergence
+        # merge separate Q,K,V into one large [Q,K,V] tensor for better efficiency
+        self.wQKV = torch.nn.Linear(self.dimEmb, self.dimEmb * 3, bias=False)
+        self.wOut = torch.nn.Linear(self.dimEmb, self.dimEmb, bias=False)
         std = 0.02 / math.sqrt(2 * numLayer)
-        torch.nn.init.normal_(self.wOut.weight, mean=0.0, std=std)
+        torch.nn.init.normal_(self.wQKV.weight, mean=0.0, std=std)
         self.dropout = torch.nn.Dropout(self.dropoutRate)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
@@ -152,10 +154,11 @@ class Attention(torch.nn.Module):
         return self.wOut(out)
 
     def forward(self, x):
-        # compute Q,K,V at once, they are in shape of [batchSize, dimEmb, dimEmb]
-        query = self.wQuery(x)
-        key = self.wKey(x)
-        value = self.wValue(x)
+        # compute Q,K,V at once, and split them into appropriate Q,K,V, they are
+        # all in shape of [batchSize, dimEmb, dimEmb], while wQKV is in shape of
+        # [batchSize, dimEmb, 3 * dimEmb]
+        qkv = self.wQKV(x)
+        query, key, value = qkv.chunk(3, dim=-1)
         # split the Q,K,V tensor into multiple heads, each head has dimHead
         # dimensions. Intuitively, I view old [batchSize, inputLen, dimEmb] as
         # [batchSize, numHead, inputLen, dimHead], but it turns out that it
@@ -390,6 +393,7 @@ class Scholar:
             {
                 "event": "config",
                 "bf16": torch.cuda.is_bf16_supported(),
+                "deviceCount": torch.cuda.device_count(),
                 "flashAttn": torch.backends.cuda.flash_sdp_enabled(),
                 "device": str(self.model.device),
                 "vocabSize": self.tokenizer.vocabSize(),
@@ -399,7 +403,7 @@ class Scholar:
         )
 
     def checkpoint(self, stepIdx, trainLoss):
-        if stepIdx %(self.gradAccumStep * 5) != 0:
+        if stepIdx % (self.gradAccumStep * 5) != 0:
             return
         # do real text generation
         self.model.eval()
@@ -429,11 +433,13 @@ class Scholar:
         self.model.saveWeights("scholar_last.bin")
 
     @torch.no_grad()
-    def validate(self):
+    def validate(self, numBatches=15):
         self.model.eval()
         totalLoss = 0.0
         totalBatch = 0
-        for input, target in self.dataloader.nextValBatch():
+        for i, (input, target) in enumerate(self.dataloader.nextValBatch()):
+            if i >= numBatches:
+                break
             input = input.to(self.model.device, non_blocking=True)
             target = target.to(self.model.device, non_blocking=True)
             # compute loss without updating weights
@@ -453,13 +459,13 @@ class Scholar:
         # it should be replaced with large data loader for streaming
         maxEpoch = self.config["numEpoch"]
         dataset = self.config["dataset"]
-        files = util.listFiles(dataset, ".txt")
+        files = util.listFiles(dataset)
         # self.dataloader = dataloader.LargeDataLoader(self.config, self.tokenizer, files)
         self.dataloader = dataloader.SimpleDataLoader(
             self.config, self.tokenizer, files
         )
         epochSteps = self.dataloader.totalTrainBatches()
-        totalSteps = math.ceil(epochSteps*maxEpoch/self.gradAccumStep)
+        totalSteps = math.ceil(epochSteps * maxEpoch / self.gradAccumStep)
         self.model.setupScheduler(totalSteps)
         if resume != "":
             self.model.loadWeights(resume)
@@ -503,7 +509,7 @@ class Scholar:
                     self.checkpoint(stepIdx, trainLoss)
                     gradAccumLoss.zero_()
             epochEnd = time.time()
-            self.saveWeights("scholar_last.bin")
+            self.model.saveWeights("scholar_last.bin")
             util.log({"epoch": epoch, "elapsed": epochEnd - epochStart})
 
     def tuning(self):
@@ -519,30 +525,3 @@ class Scholar:
         output = self.model.nextToken(sentence, numNextToken)
         pairs.append((sentence, output))
         return pairs
-
-
-if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        mode = sys.argv[1]
-        util.log({"event": "start", "mode": mode, "timestamp": time.time()})
-        g = Scholar(createModelConfig())
-        if mode == "train":
-            resume = "" if len(sys.argv) <= 2 else sys.argv[2]
-            g.train(resume)
-            util.log({"event": "end", "timestamp": time.time()})
-        elif mode == "predict":
-            sentences = sys.argv[2]
-            response = g.predict(sentences)
-            json.dump(response, sys.stdout, ensure_ascii=False)
-        elif mode == "tuning":
-            g.tuning()
-        elif mode == "debug":
-            sentence = "过儿"
-            IsDebug = True
-            print(f"@@ DebugInput: {sentence}")
-            [(_, output)] = g.predict([sentence], numNextToken=1)
-            print(f"@@ DebugOutput: {output}")
-    else:
-        print("       python scholar.py train [resume.bin]")
-        print('Usage: python scholar.py predict "杨过跳了下去，发现"')
-        print("       python scholar.py debug")

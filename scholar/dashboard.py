@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# Copyright (c) 2026 yyang with AI assistant. All rights reserved.
 """
 Scholar Dashboard - Web interface for training control, monitoring, and inference.
 Run: python dashboard.py
@@ -204,12 +203,12 @@ def draw_single_chart(chart_config: dict, ratio: int = 100):
             values = field_data[field]
             if not values:
                 continue
-            
+
             # Apply ratio: keep only the last N% of data
             if ratio < 100:
                 start_idx = int(len(values) * (100 - ratio) / 100)
                 values = values[start_idx:]
-            
+
             if not values:
                 continue
             has_data = True
@@ -643,7 +642,7 @@ def find_existing_training_processes():
                     processes = [processes]
                 for proc in processes:
                     cmdline = proc.get("CommandLine", "") or ""
-                    if "scholar.py" in cmdline and "train" in cmdline:
+                    if "main.py" in cmdline and "train" in cmdline:
                         training_processes.append(
                             {
                                 "pid": proc["ProcessId"],
@@ -660,7 +659,7 @@ def find_existing_training_processes():
                 ["ps", "aux"], capture_output=True, text=True, timeout=5
             )
             for line in result.stdout.strip().split("\n"):
-                if "scholar.py" in line and "train" in line and "grep" not in line:
+                if "main.py" in line and "train" in line and "grep" not in line:
                     parts = line.split()
                     if len(parts) >= 2:
                         pid = int(parts[1])
@@ -807,7 +806,7 @@ def api_train_start():
     resume = ""
     if request.is_json and request.json:
         resume = request.json.get("resume", "")
-    scholar_path = SCRIPT_DIR / "scholar.py"
+    scholar_path = SCRIPT_DIR / "main.py"
     log_path = SCRIPT_DIR.parent / "stdout.log"
 
     try:
@@ -815,10 +814,14 @@ def api_train_start():
         log_file.write(f"\n{'='*50}\nTraining started at {datetime.now()}\n{'='*50}\n")
         log_file.flush()
 
+        # Unbuffered stdout so print() from child (e.g. dataloader) writes to log immediately
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+
         if resume:
             train_process = subprocess.Popen(
                 [sys.executable, str(scholar_path), "train", resume],
                 cwd=str(SCRIPT_DIR.parent),
+                env=env,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 creationflags=(
@@ -835,6 +838,7 @@ def api_train_start():
             train_process = subprocess.Popen(
                 [sys.executable, str(scholar_path), "train"],
                 cwd=str(SCRIPT_DIR.parent),
+                env=env,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 creationflags=(
@@ -1016,16 +1020,16 @@ def api_logs_clear():
     log_name = request.args.get("name", "")
     if not log_name:
         return jsonify({"error": "No log file specified"}), 400
-    
+
     # Build path from filename only (security: no directory traversal)
     if ".." in log_name or "/" in log_name or "\\" in log_name:
         return jsonify({"error": "Invalid filename"}), 400
-    
+
     path = SCRIPT_DIR.parent / log_name
-    
+
     if not path.exists():
         return jsonify({"error": "File not found"}), 404
-    
+
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write("")
@@ -1359,19 +1363,19 @@ def build_html():
                                     </button>
                                 </div>
                             </div>
-                            <div class="gpu-card">
-                                <div class="gpu-header" onclick="toggleSection('gpu')">
-                                    <h3>GPU Monitor</h3>
-                                    <span class="gpu-toggle" id="gpu-toggle">▼</span>
-                                </div>
-                                <div class="gpu-content" id="gpu-content"></div>
-                            </div>
                             <div class="samples-card">
                                 <div class="samples-header" onclick="toggleSection('processes')">
                                     <h3>Training Processes</h3>
                                     <span class="samples-toggle" id="processes-toggle">▼</span>
                                 </div>
                                 <div class="samples-content" id="processes-content"></div>
+                            </div>
+                            <div class="gpu-card">
+                                <div class="gpu-header" onclick="toggleSection('gpu')">
+                                    <h3>GPU Monitor</h3>
+                                    <span class="gpu-toggle" id="gpu-toggle">▼</span>
+                                </div>
+                                <div class="gpu-content" id="gpu-content"></div>
                             </div>
                             <div class="samples-card">
                                 <div class="samples-header" onclick="toggleSection('samples')">
