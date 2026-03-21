@@ -1,22 +1,39 @@
 # Copyright (c) 2026 yyang. All rights reserved.
 import sys
 import os
-from torch import special
 import util
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+import transformers
 import scholar
 import pathlib
 
-EOT = "<|endoftext|>"
 TrainedTokenizerFile = "tokenizer.json"
 MaxVocabSize = 25000
 ScriptDir = pathlib.Path(__file__).parent
 
 
+class InternMLTokenizer:
+    def __init__(self):
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained("internlm/internlm-7b", add_bos_token=False, add_eos_token=False, trust_remote_code=True)
+
+    def encode(self, text):
+        return self.tokenizer.encode(text)
+
+    def decode(self, ids):
+        return self.tokenizer.decode(ids)
+
+    def vocabSize(self):
+        return len(self.tokenizer)
+
+    def endOfText(self):
+        # eot is guaranteed to be ONE special token
+        eosTokenId = self.tokenizer.eos_token_id
+        return (eosTokenId, self.tokenizer.decode([eosTokenId]))
+
 # Self-trained tokenizer for Jinyong-specific dataset, from huggingface/tokenizer
 class BBPETokenizer:
     def __init__(self):
-        path = str(ScriptDir / TrainedTokenizerFile)
+        path = util.getConfigPath(TrainedTokenizerFile)
         self.tokenizer = Tokenizer.from_file(path)
 
     def decode(self, ids):
@@ -32,6 +49,7 @@ class BBPETokenizer:
         # eot is guaranteed to be ONE special token
         return (self.encode(EOT)[0], EOT)
 
+
 def createSpecialTokens(files):
     specialTokens = []
     for file in files:
@@ -39,10 +57,9 @@ def createSpecialTokens(files):
         specialTokens.append(f"<|{name}|>")
     return specialTokens
 
+
 def trainTokenizer():
-    files = util.listFiles(
-        scholar.createModelConfig()["dataset"], ".txt", []
-    )
+    files = util.listFiles(scholar.createModelConfig()["dataset"], ".txt", [])
     print(f"@@ Training tokenizer with {len(files)} files")
     tokenizer = Tokenizer(models.BPE())
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
@@ -58,13 +75,13 @@ def trainTokenizer():
     )
 
     tokenizer.train(files, trainer)
-    path = str(ScriptDir / TrainedTokenizerFile)
+    path = util.getConfigPath(TrainedTokenizerFile)
     tokenizer.save(path)
     print(f"@@ Save tokenizer to {path}")
 
 
 def testTokenizer():
-    path = str(ScriptDir / TrainedTokenizerFile)
+    path = util.getConfigPath(TrainedTokenizerFile)
     tokenizer = Tokenizer.from_file(path)
     sentences = [
         "杨过",
@@ -92,9 +109,35 @@ def testTokenizer():
         decodeTokens = [tokenizer.decode([i]) for i in encoded.ids]
         print(f"@@ Decoded: '{decodeTokens}'")
 
+def createTokenizer(name):
+    registry = {
+        "InternMLTokenizer": InternMLTokenizer,
+        "BBPETokenizer": BBPETokenizer,
+    }
+    if name not in registry:
+        raise RuntimeError(f"Unknown tokenizer {name}, available: {list(registry.keys())}")
+    return registry[name]()
+
+
+def testInternMLTokenizer():
+    tokenizer = InternMLTokenizer()
+    sentences = [
+        "杨过",
+        "杨过和小龙女在",
+        "神雕大侠",
+    ]
+    for sentence in sentences:
+        encoded = tokenizer.encode(sentence)
+        print(f"@@ Raw:      {sentence}")
+        print(f"@@ Encoded: '{encoded}'")
+        decoded = tokenizer.decode(encoded)
+        print(f"@@ Decoded: '{decoded}'")
+    print(f"@@ Vocab size: {tokenizer.vocabSize()}")
+    print(f"@@ End of text: {tokenizer.endOfText()}")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "train":
         trainTokenizer()
     else:
         testTokenizer()
+        testInternMLTokenizer()

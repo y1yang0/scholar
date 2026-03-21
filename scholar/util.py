@@ -2,11 +2,20 @@
 import json
 import torch
 import os
+import pathlib
 
+ScriptDir = pathlib.Path(__file__).parent
 
-def getTorchDevice():
+def loadConfig(path):
+    with open(getConfigPath(path), "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def getConfigPath(path):
+    return str(ScriptDir / "config" / path)
+
+def getTorchDevice(localRank):
     if torch.cuda.is_available():
-        return torch.device("cuda")
+        return torch.device(f"cuda:{localRank}")
     elif torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")

@@ -1,0 +1,18 @@
+{
+    "tokenizer": "InternMLTokenizer",
+    "dimEmb": 1024,
+    "dimFFN": 4096,
+    "numLayer": 26,
+    "numHead": 16,
+    "maxWindowSize": 1024,
+    "dropoutRate": 0.0,
+    "peakLR": 2e-4,
+    "minLR": 2e-5,
+    "numEpoch": 1,
+    "batchSize": 16,
+    "gradAccumStep": 16,
+    "trainDataRatio": 0.90,
+    "temperature": 0.8,
+    "topP": 0.9,
+    "repeatPenalty": 1.1
+}

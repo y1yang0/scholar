@@ -12,52 +12,8 @@ import json
 IsDebug = False
 Inspector = util.Inspector()
 
-Sentences = [
-    "杨过和小龙女在",
-    "神雕大侠",
-    "韦小宝和双儿",
-    "围攻光明顶",
-    "郭靖和黄蓉",
-    "张无忌",
-    "令狐冲说",
-    "华山论剑",
-    "桃花岛上",
-    "令狐冲看到盈盈，问道",
-    "他使出一剑",
-    "女子冷哼一声",
-    "你懂剑法吗？",
-    "一剑刺中了",
-    "东方不败冷笑一声，手中的绣花针",
-    "乔峰大喝一声，掌力如怒潮般向慕容复",
-    "张无忌回想起赵敏那盈盈笑语，又念及周芷若的楚楚可怜，一时间",
-    "两人双掌相交，只听得“砰”的一声巨响，登时",
-    "那长剑来势奇快，剑尖已堪堪触及他胸口大穴，就在这千钧一发之际，",
-    "此时正值深夜，窗外狂风大作，暴雨倾盆。破庙之中，",
-    "望着他远去的背影，她心中一阵酸楚，两行清泪",
-    "老者厉声喝道：“你这贼子，今日休想活着离开！”说罢，",
-]
-
-
 def createModelConfig():
-    config = {
-        "dataset": ["data/small", "data/extend"],
-        "dimEmb": 640,
-        "dimFFN": int(4 * 640),  # int(2 / 3 * 4 * 384)
-        "numLayer": 16,
-        "numHead": 10,
-        "maxWindowSize": 1024,
-        "dropoutRate": 0.3,
-        "peakLR": 3e-4,
-        "minLR": 3e-5,
-        "numEpoch": 3,
-        "batchSize": 8,
-        "gradAccumStep": 16,
-        "trainDataRatio": 0.90,
-        "temperature": 0.7,
-        "topP": 0.85,
-        "repeatPenalty": 1.3,
-    }
-    return config
+    return util.loadConfig("model647m.json")
 
 
 class Normalization(torch.nn.Module):
@@ -219,7 +175,7 @@ class Transformer(torch.nn.Module):
 
 
 class Model(torch.nn.Module):
-    def __init__(self, config, tokenizer):
+    def __init__(self, config, tokenizer, device):
         super().__init__()
         torch.manual_seed(0xCAFEBABE)
         torch.set_float32_matmul_precision("high")
@@ -229,7 +185,7 @@ class Model(torch.nn.Module):
         self.tokenizer = tokenizer
         self.endOfTextId, _ = tokenizer.endOfText()
         self.vocabSize = tokenizer.vocabSize()
-        self.device = util.getTorchDevice()
+        self.device = device
         self.tokenEmbedding = torch.nn.Embedding(self.vocabSize, dimEmb)
         cos, sin = self.initRoPE(config["maxWindowSize"], dimHead)
         self.transformers = torch.nn.ModuleList(
@@ -240,28 +196,6 @@ class Model(torch.nn.Module):
             dimEmb, self.vocabSize, bias=False
         )  # no weight tying
         self.to(self.device)
-        self.optimizer = torch.optim.AdamW(
-            self.parameters(), lr=config["peakLR"], fused=util.cudaAvailable()
-        )
-        self.scheduler = None
-        self.gradNorm = None
-
-    def setupScheduler(self, totalSteps):
-        warmupSteps = int(totalSteps * 0.1)
-        # start from peakLR * 0.01 to peakLR * 1
-        warmupScheduler = torch.optim.lr_scheduler.LinearLR(
-            self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmupSteps
-        )
-        decaySteps = int(totalSteps - warmupSteps)
-        # decay from peakLR * 1 to minLR
-        decayScheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=decaySteps, eta_min=self.config["minLR"]
-        )
-        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
-            self.optimizer,
-            schedulers=[warmupScheduler, decayScheduler],
-            milestones=[warmupSteps],
-        )
 
     def initRoPE(self, maxWindowSize, dimHead):
         # freq = 10000 ^ (-2 * i / dimHead), where i is in [0, 1,..., dimHead//2]
@@ -280,6 +214,17 @@ class Model(torch.nn.Module):
         x = self.finalNorm(x)
         Inspector.trace("FinalNorm", x) if IsDebug else None
         return self.out(x)
+    
+    def accuracy(self, output, target, ignoreIndex):
+        # find the index of the predicted token that has the highest probability
+        valid = target != ignoreIndex
+        predicted = output.argmax(dim=-1)
+        # compare the predicted token with the target token
+        correct = (predicted == target) & valid
+        if valid.sum() > 0:
+            return correct.sum() / valid.sum()
+        else:
+            return torch.tensor(0.0, device=self.device)
 
     def loss(self, output, target):
         # cross-entrypy loss asks for (numSample, numClass) and (numSample) as input
@@ -290,34 +235,11 @@ class Model(torch.nn.Module):
         # as out(batchSize * inputLen, vocabSize) and target(batchSize * inputLen)
         output = output.view(output.shape[0] * output.shape[1], output.shape[2])
         target = target.view(target.shape[0] * target.shape[1])
-        loss = torch.nn.functional.cross_entropy(output, target, ignore_index=-100)
-        return loss
-
-    def updateWeight(self):
-        # prevent the exploding gradient problem
-        self.gradNorm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-        self.optimizer.step()
-        self.optimizer.zero_grad()
-        # update learning rate
-        self.scheduler.step()
-
-    def saveWeights(self, path):
-        torch.save(
-            {
-                "model": self.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "scheduler": self.scheduler.state_dict(),
-            },
-            path,
-        )
-        util.log({"msg": f"Model saved to {path}"})
-
-    def loadWeights(self, path):
-        data = torch.load(path, weights_only=False, map_location=self.device)
-        self.load_state_dict(data["model"])
-        self.optimizer.load_state_dict(data["optimizer"])
-        self.scheduler.load_state_dict(data["scheduler"]) if self.scheduler else None
-        util.log({"msg": f"Model loaded from {path}"})
+        ignoreIndex = -100
+        loss = torch.nn.functional.cross_entropy(output, target, ignore_index=ignoreIndex)
+        # compute token accuracy = correct tokens / total tokens
+        accu = self.accuracy(output, target, ignoreIndex)
+        return loss, accu
 
     def topP(self, logits):
         logits, idx = torch.sort(logits, descending=True)
@@ -376,152 +298,337 @@ class Model(torch.nn.Module):
             tokens.append(nextTokenId.item())
         return self.tokenizer.decode(tokens[numInitTokens:])
 
+class ModelOptim:
+    def __init__(self, config, model, totalSteps):
+        self.config = config
+        self.model = model
+        self.optimizer = self.setupOptimizer()
+        self.scheduler = self.setupScheduler(totalSteps)
+        self.gradNorm = None
+
+    def setupOptimizer(self):
+        return torch.optim.AdamW(
+            self.model.parameters(), lr=self.config["peakLR"], fused=util.cudaAvailable()
+        )
+
+    def setupScheduler(self, totalSteps):
+        warmupSteps = int(totalSteps * 0.1)
+        # start from peakLR * 0.01 to peakLR * 1
+        warmupScheduler = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmupSteps
+        )
+        decaySteps = int(totalSteps - warmupSteps)
+        # decay from peakLR * 1 to minLR
+        decayScheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=decaySteps, eta_min=self.config["minLR"]
+        )
+        return torch.optim.lr_scheduler.SequentialLR(
+            self.optimizer,
+            schedulers=[warmupScheduler, decayScheduler],
+            milestones=[warmupSteps],
+        )
+
+    def update(self):
+        # prevent the exploding gradient problem
+        self.gradNorm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        # update learning rate
+        self.scheduler.step()
+
 
 class Scholar:
+    """Scholar is used for training the model"""
     def __init__(self, config):
         self.config = config
-        self.tokenizer = tokenizer.BBPETokenizer()
-        self.model = Model(config, self.tokenizer)
-        self.dataloader = None
         self.gradAccumStep = config["gradAccumStep"]
-        # training statistics
+        self.tokenizer = tokenizer.createTokenizer(config["tokenizer"])
+        # model and optimizer
+        self.localRank, self.globalRank, self.worldSize = self.setupDDP()
+        self.device = util.getTorchDevice(self.localRank)
+        self.model = None
+        self.modelOptim = None
+        # dataset
+        self.trainDataset = None
+        self.valDataset = None
+        self.trainSampler = None
+        self.valSampler = None
+        self.trainLoader = None
+        self.valLoader = None
+        # statistics
         self.bestValLoss = float("inf")
+        self.stepsElapsed = 0
+    
+    def log(self, kvals):
+        # only log on the rank-0 process
+        util.log(kvals) if self.globalRank == 0 else None
+    
+    def saveModel(self, path):
+        if self.globalRank != 0:
+            return
+        # model is wrapped at this point, so I need to access the original model
+        # I need to save the best val loss otherwise the model will always update
+        # this value when resuming training.
+        torch.save(
+            {
+                "model": self.model.module.state_dict(),
+                "optimizer": self.modelOptim.optimizer.state_dict(),
+                "scheduler": self.modelOptim.scheduler.state_dict(),
+                "bestValLoss": self.bestValLoss,
+            },
+            path,
+        )
+        self.log({"msg": f"Model saved to {path}"})
+    
+    def initModel(self, resumeData = None):
+        # create model on specific device
+        self.model = Model(self.config, self.tokenizer, self.device)
+        self.model = (
+            torch.compile(self.model) if sys.platform != "win32" else self.model
+        )
+        if resumeData != None:
+            self.model.load_state_dict(resumeData["model"])
+            self.bestValLoss = resumeData["bestValLoss"]
 
-    def logConfig(self):
-        totalParams = sum(p.numel() for p in self.model.parameters())
-        util.log(
+    def initModelOptim(self, epochSteps, resumeData = None):
+        maxEpoch = self.config["numEpoch"]
+        totalSteps = math.ceil(epochSteps * maxEpoch / self.gradAccumStep)
+        self.modelOptim = ModelOptim(self.config, self.model, totalSteps)
+        if resumeData != None:
+            self.modelOptim.optimizer.load_state_dict(resumeData["optimizer"])
+            self.modelOptim.scheduler.load_state_dict(resumeData["scheduler"])
+    
+    def initDataset(self):
+        mixedDataset = dataloader.MixedDataLoader(self.config, self.tokenizer, self.worldSize)
+        self.trainDataset = mixedDataset.getTrainDataset()
+        self.valDataset = mixedDataset.getValDataset()
+        self.trainSampler = torch.utils.data.distributed.DistributedSampler(
+            self.trainDataset,
+            num_replicas=self.worldSize,
+            rank=self.globalRank,
+            shuffle=True,
+            seed=0xCAFEBABE,
+        )
+        self.trainLoader = torch.utils.data.DataLoader(
+            self.trainDataset,
+            sampler=self.trainSampler,
+            batch_size=self.config["batchSize"],
+            num_workers=1,
+            pin_memory=True,
+        )
+        self.valSampler = torch.utils.data.distributed.DistributedSampler(
+            self.valDataset,
+            num_replicas=self.worldSize,
+            rank=self.globalRank,
+            shuffle=False,
+            seed=0xCAFEBABE,
+        )
+        self.valLoader = torch.utils.data.DataLoader(
+            self.valDataset,
+            sampler=self.valSampler,
+            batch_size=self.config["batchSize"],
+            num_workers=4,
+            pin_memory=True,
+        )
+
+    def setupDDP(self):
+        # torchr automatically setups RANK/LOCAL_RANK/WORLD_SIZE env variables
+        # RANK indicates the global rank of the process
+        # LOCAL_RANK indicates the rank of the process on the current node
+        # WORLD_SIZE indicates the total number of processes
+        torch.distributed.init_process_group(group_name="gscholar",backend="nccl")
+        localRank = int(os.getenv("LOCAL_RANK", "0"))
+        globalRank = int(os.getenv("RANK", "0"))
+        worldSize = int(os.getenv("WORLD_SIZE", "1"))
+        torch.cuda.set_device(localRank)
+        return localRank, globalRank, worldSize
+    
+    def cleanupDDP(self):
+        torch.distributed.destroy_process_group()
+
+    @torch.no_grad()
+    def validate(self):
+        self.model.eval()
+        lossAccum = torch.tensor(0.0, device=self.device)
+        accuAccum = torch.tensor(0.0, device=self.device)
+        numBytes = torch.tensor(0, dtype=torch.long, device=self.device)
+        stepIdx = 0
+        for batch in self.valLoader:
+            stepIdx += 1
+            inputs, targets = batch["inputs"], batch["targets"]
+            for seq in inputs.tolist():
+                seqBytes = self.tokenizer.decode(seq).encode('utf-8')
+                numBytes += len(seqBytes)
+            inputs = inputs.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
+            # compute loss without updating weights
+            with torch.autocast(
+                device_type=self.device.type,
+                dtype=torch.bfloat16,
+                enabled=torch.cuda.is_bf16_supported(),
+            ):
+                output = self.model.forward(inputs)
+                loss, accu = self.model.module.loss(output, targets)
+            lossAccum += loss.detach()
+            accuAccum += accu.detach()
+
+        # reduce all replicas to get the average loss and accuracy
+        torch.distributed.all_reduce(lossAccum, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(accuAccum, op=torch.distributed.ReduceOp.SUM)
+        # also reduce numBytes if we are in DDP
+        torch.distributed.all_reduce(numBytes, op=torch.distributed.ReduceOp.SUM)
+
+        # calculate the average loss and accuracy
+        totalLoss = lossAccum.item() / (stepIdx * self.worldSize)
+        totalAccu = accuAccum.item() / (stepIdx * self.worldSize)
+        # calculate the bpb
+        numTokens = self.config["maxWindowSize"] * self.config["batchSize"] * stepIdx * self.worldSize
+        bpb = (totalLoss / math.log(2)) * numTokens / numBytes.item()
+        return totalLoss, totalAccu, bpb
+
+    def checkpoint(self, stepIdx, lossAccum, accuAccum):
+        stepInterval = self.gradAccumStep * 60
+        statistics = {}
+
+        if stepIdx % stepInterval == 0:
+            # On all replicas:
+            # ReduceOp must be performed on all replicas
+            torch.distributed.all_reduce(lossAccum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(accuAccum, op=torch.distributed.ReduceOp.SUM)
+            trainLoss = (lossAccum / (stepInterval * self.worldSize)).item()
+            trainAccuracy = (accuAccum / (stepInterval * self.worldSize)).item()
+            stepsElapsed = time.time() - self.stepsElapsed
+            throughput = self.config["maxWindowSize"] * self.config["batchSize"] * stepInterval * self.worldSize
+            throughput = throughput / stepsElapsed
+            gradNorm = self.modelOptim.gradNorm.item()
+            currentLR = self.modelOptim.optimizer.param_groups[0]["lr"]
+            statistics["event"] = "metrics"
+            statistics["step"] = stepIdx
+            statistics["currentLR"] = currentLR
+            statistics["gradNorm"] = gradNorm
+            statistics["trainLoss"] = trainLoss
+            statistics["trainAccuracy"] = trainAccuracy
+            statistics["throughpt"] = throughput
+
+            # cleanup up
+            lossAccum.zero_()
+            accuAccum.zero_()
+            self.stepsElapsed = time.time() # reset the timer
+    
+            if stepIdx % (stepInterval*2) == 0:
+                # On all replicas:
+                # validate the model performance
+                valLoss, valAccuracy, valBPB = self.validate()
+                statistics["valLoss"] = valLoss
+                statistics["valPPL"] = math.exp(valLoss)
+                statistics["valAccuracy"] = valAccuracy
+                statistics["valBPB"] = valBPB
+                # On rank-0 replica:
+                # find best model
+                if self.globalRank == 0:
+                    if valLoss < self.bestValLoss:
+                        self.saveModel("scholar_best.bin")
+                        self.bestValLoss = valLoss
+                    self.saveModel("scholar_last.bin")
+            # On rank-0 replica:
+            if self.globalRank == 0 and len(statistics) > 0:
+                self.log(statistics)
+
+
+    def bootTrain(self, resume):
+        # setup the data loader
+        self.initDataset()
+        data = torch.load(resume, weights_only=False, map_location=self.device) if resume != "" else None
+        self.initModel(data)
+        epochSteps = len(self.trainLoader)
+        self.initModelOptim(epochSteps, data)
+        # wrap the model so that it can be trained in distributed manner
+        self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.localRank])
+        # log the training configuration
+        totalParams = sum(p.numel() for p in self.model.module.parameters())
+        self.log(
             {
                 "event": "config",
+                "worldSize": self.worldSize,
                 "bf16": torch.cuda.is_bf16_supported(),
                 "deviceCount": torch.cuda.device_count(),
                 "flashAttn": torch.backends.cuda.flash_sdp_enabled(),
-                "device": str(self.model.device),
+                "device": str(self.device),
                 "vocabSize": self.tokenizer.vocabSize(),
                 "params": totalParams,
                 **self.config,
             }
         )
+        self.log({"event": "startTrain", "timestamp": time.time()})
 
-    def checkpoint(self, stepIdx, trainLoss):
-        if stepIdx % (self.gradAccumStep * 5) != 0:
-            return
-        # do real text generation
-        self.model.eval()
-        for i, sentence in enumerate(Sentences):
-            output = self.model.nextToken(sentence, numNextToken=20)
-            util.log({"idx": i, "input": sentence, "output": output})
-        # validate the model performance
-        valLoss = self.validate()
-        # log critical training statistics
-        gradNorm = self.model.gradNorm.item()
-        currentLR = self.model.optimizer.param_groups[0]["lr"]
-        util.log(
-            {
-                "step": stepIdx,
-                "currentLR": currentLR,
-                "gradNorm": gradNorm,
-                "trainLoss": trainLoss,
-                "valLoss": valLoss,
-                "trainPPL": math.exp(trainLoss),
-                "valPPL": math.exp(valLoss),
-            }
-        )
-        # find best model
-        if valLoss < self.bestValLoss:
-            self.model.saveWeights("scholar_best.bin")
-            self.bestValLoss = valLoss
-        self.model.saveWeights("scholar_last.bin")
-
-    @torch.no_grad()
-    def validate(self, numBatches=15):
-        self.model.eval()
-        totalLoss = 0.0
-        totalBatch = 0
-        for i, (input, target) in enumerate(self.dataloader.nextValBatch()):
-            if i >= numBatches:
-                break
-            input = input.to(self.model.device, non_blocking=True)
-            target = target.to(self.model.device, non_blocking=True)
-            # compute loss without updating weights
-            with torch.autocast(
-                device_type=self.model.device.type,
-                dtype=torch.bfloat16,
-                enabled=torch.cuda.is_bf16_supported(),
-            ):
-                output = self.model.forward(input)
-                loss = self.model.loss(output, target)
-            totalLoss += loss.item()
-            totalBatch += 1
-        return totalLoss / totalBatch
-
-    def bootTrain(self, resume):
-        # use simple data loader to load Jinyong's novels all at once
-        # it should be replaced with large data loader for streaming
-        maxEpoch = self.config["numEpoch"]
-        dataset = self.config["dataset"]
-        files = util.listFiles(dataset)
-        # self.dataloader = dataloader.LargeDataLoader(self.config, self.tokenizer, files)
-        self.dataloader = dataloader.SimpleDataLoader(
-            self.config, self.tokenizer, files
-        )
-        epochSteps = self.dataloader.totalTrainBatches()
-        totalSteps = math.ceil(epochSteps * maxEpoch / self.gradAccumStep)
-        self.model.setupScheduler(totalSteps)
-        if resume != "":
-            self.model.loadWeights(resume)
-        self.model = (
-            torch.compile(self.model) if sys.platform != "win32" else self.model
-        )
-        self.logConfig()
+    def postTrain(self):
+        self.cleanupDDP()
+        self.log({"event": "endTrain", "timestamp": time.time()})
 
     def trainStep(self, input, target):
         self.model.train()
-        input = input.to(self.model.device, non_blocking=True)
-        target = target.to(self.model.device, non_blocking=True)
+        input = input.to(self.device, non_blocking=True)
+        target = target.to(self.device, non_blocking=True)
         with torch.autocast(
-            device_type=self.model.device.type,
+            device_type=self.device.type,
             dtype=torch.bfloat16,
             enabled=torch.cuda.is_bf16_supported(),
         ):
             output = self.model.forward(input)
-            loss = self.model.loss(output, target)
+            loss, accu = self.model.module.loss(output, target)
         # I update the weights every gradAccumStep steps, so the backward loss
         # should be scaled as well to compensate for the smaller update frequency
         lossScaled = loss / self.gradAccumStep
         lossScaled.backward()
-        return loss
+        return loss, accu
 
     def train(self, resume=""):
         self.bootTrain(resume)
-        print(f"@@ Training...")
         stepIdx = 0
-        gradAccumLoss = torch.tensor(0.0, device=self.model.device)
+        lossAccum = torch.tensor(0.0, device=self.device)
+        accuAccum = torch.tensor(0.0, device=self.device)
+        print(f"@@ Training on rank {self.globalRank}/{self.worldSize}...")
         for epoch in range(self.config["numEpoch"]):
             epochStart = time.time()
-            for input, target in self.dataloader.nextTrainBatch():
-                loss = self.trainStep(input, target)
-                # accumulate loss on GPU
-                gradAccumLoss += loss.detach()
+            self.trainSampler.set_epoch(epoch)
+            self.stepsElapsed = time.time()
+            for batch in self.trainLoader:
                 stepIdx += 1
-                if stepIdx % self.gradAccumStep == 0:
-                    self.model.updateWeight()
-                    trainLoss = (gradAccumLoss / self.gradAccumStep).item()
-                    self.checkpoint(stepIdx, trainLoss)
-                    gradAccumLoss.zero_()
+                stepUpdate = stepIdx % self.gradAccumStep == 0
+                inputs, targets = batch["inputs"], batch["targets"]
+                # gradient sync is only performed at the end of each mini-batch
+                if stepUpdate:
+                    loss, accu = self.trainStep(inputs, targets)
+                else:
+                    with self.model.no_sync():
+                        loss, accu = self.trainStep(inputs, targets)
+                # accumulate loss and accuracy on GPU
+                lossAccum += loss.detach()
+                accuAccum += accu.detach()
+                # update weights, logging, etc
+                if stepUpdate:
+                    self.modelOptim.update()
+                    self.checkpoint(stepIdx, lossAccum, accuAccum)
             epochEnd = time.time()
-            self.model.saveWeights("scholar_last.bin")
-            util.log({"epoch": epoch, "elapsed": epochEnd - epochStart})
+            self.saveModel("scholar_last.bin")
+            self.log({"epoch": epoch, "elapsed": epochEnd - epochStart})
+        self.postTrain()
 
-    def tuning(self):
-        self.config["peakLR"] = 3e-5
-        self.dataloader = dataloader.SFTDataLoader(self.config, self.tokenizer)
-        self.train()
+
+class Predictor:
+    """Predictor is used for predicting the next token"""
+    def __init__(self, config, path):
+        self.config = config
+        self.tokenizer = tokenizer.createTokenizer(config["tokenizer"])
+        self.device = util.getTorchDevice(0)
+        self.model = Model(config, self.tokenizer, self.device)
+        data = torch.load(path, map_location=self.device)
+        state_dict = data["model"]
+        # Remove '_orig_mod.' prefix added by torch.compile if present
+        clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        self.model.load_state_dict(clean_state_dict)
 
     @torch.no_grad()
     def predict(self, sentence, numNextToken=50):
         self.model.eval()
-        self.model.loadWeights("scholar_last.bin")
-        pairs = []
-        output = self.model.nextToken(sentence, numNextToken)
-        pairs.append((sentence, output))
-        return pairs
+        return self.model.nextToken(sentence, numNextToken)

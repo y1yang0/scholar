@@ -1,0 +1,17 @@
+{
+    "tokenizer": "BBPETokenizer",
+    "dimEmb": 384,
+    "dimFFN": 1536,
+    "numLayer": 18,
+    "numHead": 6,
+    "maxWindowSize": 768,
+    "dropoutRate": 0.3,
+    "peakLR": 3e-4,
+    "minLR": 3e-5,
+    "numEpoch": 12,
+    "batchSize": 16,
+    "trainDataRatio": 0.90,
+    "temperature": 0.7,
+    "topP": 0.85,
+    "repeatPenalty": 1.3
+}

@@ -6,36 +6,37 @@
 
 ----
 
-**Scholar Commands**
-
-Install dependencies
-```
-$ pip install -r requirements.txt
-```
-
-Pre-training the model
-```
-$ git clone --branch master https://huggingface.co/datasets/y1yang0/scholar-novels-curated data
-$ hf download y1yang0/scholar-novels-curated --repo-type=dataset --local-dir ./data --revision master # or you prefer hf tool
-$ python scholar/scholar.py train
-```
-
-Generating next few words
-```
-$ python scholar/scholar.py predict
-```
-
-Inspecting model internals
-```
-$ python scholar/scholar.py debug
-```
-
----
-
 **Scholar Dashboard**
 
-Use `python scholar/dashboard.py` to run dashboard
+Just run `python scholar/dashboard.py` and open `http://localhost:5002` in your browser.
 
 ![](misc/dashboard1.png)
 ![](misc/dashboard2.png)
 ![](misc/dashboard3.png)
+
+---
+
+**Scholar Commands**
+
+**Install dependencies**
+```
+$ pip install -r requirements.txt
+```
+GPU device is also required.
+
+**Pre-training the model:**
+```
+#  torchrun --nproc_per_node=1 scholar/main.py train
+```
+Use `CUDA_VISIBLE_DEVICES=0` to specify the certain GPU device to use.
+Alternatively, you can use dashboard to start training. It's the recommended way.
+
+**Generating next few words:**
+```
+$ python scholar/main.py predict "杨过的姑姑"
+```
+
+**Inspecting model internals:**
+```
+$ python scholar/main.py debug
+```

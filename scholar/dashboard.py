@@ -8,6 +8,9 @@ Open: http://localhost:5002
 import io
 import os
 import sys
+import threading
+import traceback
+import time
 import json
 import base64
 import hashlib
@@ -17,8 +20,9 @@ import logging
 import matplotlib
 
 matplotlib.use("Agg")
+_matplotlib_lock = threading.Lock()
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import MaxNLocator, FuncFormatter
 from pathlib import Path
 from datetime import datetime
 from flask import Flask, jsonify, request, Response
@@ -56,8 +60,9 @@ charts = [
         "files": ["../train.log"],
         "fields": ["elapsed"],
         "xlabel": "Epoch",
-        "ylabel": "seconds",
+        "ylabel": "Time",
         "title": "Elapsed",
+        "ytype": "time",
     },
     {
         "files": ["../train.log"],
@@ -73,10 +78,42 @@ charts = [
         "ylabel": "Learning Rate",
         "title": "Learning Rate",
     },
+    {
+        "files": ["../train.log"],
+        "fields": ["trainAccuracy"],
+        "xlabel": "Iteration",
+        "ylabel": "Accuracy",
+        "title": "Train Accuracy",
+        "ytype": "percent",
+    },
+    {
+        "files": ["../train.log"],
+        "fields": ["valAccuracy"],
+        "xlabel": "Iteration",
+        "ylabel": "Accuracy",
+        "title": "Val Accuracy",
+        "ytype": "percent",
+    },
+    {
+        "files": ["../train.log"],
+        "fields": ["throughpt"],
+        "xlabel": "Iteration",
+        "ylabel": "Tokens/s",
+        "title": "Throughput",
+        "ytype": "number",
+    },
+    {
+        "files": ["../train.log"],
+        "fields": ["valBPB"],
+        "xlabel": "Iteration",
+        "ylabel": "BPB",
+        "title": "Bits Per Byte",
+        "ytype": "number",
+    },
 ]
-metrics = [
-    {"file": "../train.log", "type": "uptime", "title": "Uptime"},
+config_metrics = [
     {"file": "../train.log", "event": "config"},
+    {"file": "../train.log", "event": "dataset"},
 ]
 port = 5002
 refresh_interval = 3
@@ -150,6 +187,85 @@ def get_gpu_stats():
         return []
 
 
+def get_device_stats():
+    """Return disk, memory, GPU, CPU stats for device monitoring."""
+    stats = {"disk": [], "memory": {}, "gpu": [], "cpu": {}}
+    try:
+        import psutil
+    except ImportError:
+        return stats
+
+    # Disk: root and workspace
+    try:
+        for path in ["/", str(SCRIPT_DIR.parent)]:
+            try:
+                du = psutil.disk_usage(path)
+                stats["disk"].append(
+                    {
+                        "path": path,
+                        "total_gb": round(du.total / (1024**3), 2),
+                        "used_gb": round(du.used / (1024**3), 2),
+                        "free_gb": round(du.free / (1024**3), 2),
+                        "percent": du.percent,
+                    }
+                )
+            except (OSError, PermissionError):
+                pass
+    except Exception:
+        pass
+
+    # Memory
+    try:
+        vm = psutil.virtual_memory()
+        stats["memory"] = {
+            "total_gb": round(vm.total / (1024**3), 2),
+            "available_gb": round(vm.available / (1024**3), 2),
+            "used_gb": round(vm.used / (1024**3), 2),
+            "percent": vm.percent,
+        }
+    except Exception:
+        pass
+
+    # GPU (reuse existing)
+    stats["gpu"] = get_gpu_stats()
+
+    # CPU
+    try:
+        stats["cpu"] = {
+            "percent": round(psutil.cpu_percent(interval=0.1), 1),
+            "count": psutil.cpu_count(logical=False) or psutil.cpu_count() or 1,
+            "count_logical": psutil.cpu_count() or 1,
+        }
+    except Exception:
+        pass
+
+    return stats
+
+
+def get_y_formatter(ytype: str):
+    """Return a FuncFormatter for y-axis based on ytype: percent, time, or number."""
+    if ytype == "percent":
+        return FuncFormatter(lambda x, _: f"{x * 100:.1f}%")
+    if ytype == "time":
+        def _time_fmt(x, _):
+            if x >= 3600:
+                return f"{x / 3600:.1f}h"
+            return f"{x / 60:.0f}m"
+        return FuncFormatter(_time_fmt)
+    return None
+
+
+def format_y_value(val, ytype: str):
+    """Format a value for display in stats line based on ytype."""
+    if ytype == "percent":
+        return f"{val * 100:.1f}%"
+    if ytype == "time":
+        if val >= 3600:
+            return f"{val / 3600:.1f}h"
+        return f"{val / 60:.0f}m"
+    return f"{val:.4g}"
+
+
 def parse_log_file(log_path: str, fields: list):
     result = {field: [] for field in fields}
     try:
@@ -176,6 +292,7 @@ def draw_single_chart(chart_config: dict, ratio: int = 100):
     xlabel = chart_config.get("xlabel", "Iteration")
     ylabel = chart_config.get("ylabel", "Value")
     title = chart_config.get("title", "")
+    ytype = chart_config.get("ytype", "number")
 
     colors = [
         "#1f77b4",
@@ -239,7 +356,7 @@ def draw_single_chart(chart_config: dict, ratio: int = 100):
                 marker="^",
             )
             stats_lines.append(
-                f"{label}: min={min_val:.4g}  max={max_val:.4g}  cur={cur_val:.4g}"
+                f"{label}: min={format_y_value(min_val, ytype)}  max={format_y_value(max_val, ytype)}  cur={format_y_value(cur_val, ytype)}"
             )
 
     if not has_data:
@@ -261,20 +378,24 @@ def draw_single_chart(chart_config: dict, ratio: int = 100):
     if has_data:
         ax.legend(loc="upper right", fontsize=9)
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    if has_data and ytype != "number":
+        fmt = get_y_formatter(ytype)
+        if fmt:
+            ax.yaxis.set_major_formatter(fmt)
     if stats_lines:
         fig.text(
             0.5, 0.02, "  |  ".join(stats_lines), ha="center", fontsize=10, color="#333"
         )
     plt.tight_layout(rect=[0, 0.08, 1, 1])
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
     buf.seek(0)
     img_base64 = base64.b64encode(buf.read()).decode("utf-8")
     plt.close(fig)
     return img_base64
 
 
-def draw_all_charts_combined():
+def draw_all_charts_combined(ratio: int = 100):
     import math
 
     n = len(charts)
@@ -282,8 +403,8 @@ def draw_all_charts_combined():
         return None
     cols = 2
     rows = math.ceil(n / cols)
-    fig, axes = plt.subplots(rows, cols, figsize=(16, 5 * rows))
-    axes = axes.flatten() if n > 1 else [axes]
+    fig, axes = plt.subplots(rows, cols, figsize=(16, 5 * rows), squeeze=False)
+    axes = axes.flatten()
     colors = [
         "#1f77b4",
         "#ff7f0e",
@@ -302,6 +423,7 @@ def draw_all_charts_combined():
         xlabel = chart_config.get("xlabel", "Iteration")
         ylabel = chart_config.get("ylabel", "Value")
         title = chart_config.get("title", "")
+        ytype = chart_config.get("ytype", "number")
         has_data = False
         color_idx = 0
 
@@ -314,6 +436,11 @@ def draw_all_charts_combined():
             field_data = parse_log_file(str(path), fields)
             for field in fields:
                 values = field_data[field]
+                if not values:
+                    continue
+                if ratio < 100:
+                    start_idx = int(len(values) * (100 - ratio) / 100)
+                    values = values[start_idx:]
                 if not values:
                     continue
                 has_data = True
@@ -362,12 +489,16 @@ def draw_all_charts_combined():
         if has_data:
             ax.legend(loc="upper right", fontsize=8)
         ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        if has_data and ytype != "number":
+            fmt = get_y_formatter(ytype)
+            if fmt:
+                ax.yaxis.set_major_formatter(fmt)
 
     for j in range(i + 1, len(axes)):
         axes[j].axis("off")
     plt.tight_layout()
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
     buf.seek(0)
     img_data = buf.read()
     plt.close(fig)
@@ -401,6 +532,8 @@ def format_value(val):
     if isinstance(val, float):
         return f"{val:.2e}" if val < 0.01 else f"{val:.4g}"
     if isinstance(val, int):
+        if val >= 1_000_000_000:
+            return f"{val/1_000_000_000:.1f}B"
         if val >= 1_000_000:
             return f"{val/1_000_000:.1f}M"
         if val >= 1_000:
@@ -408,11 +541,12 @@ def format_value(val):
     return str(val)
 
 
-def get_metrics_data():
-    import time
-
+def get_config_data():
+    """Get event:config data for Config tab."""
     result = []
-    for m in metrics:
+    for m in config_metrics:
+        if m.get("event") != "config":
+            continue
         mtype = m.get("type", "")
         file_path = m.get("file", "")
         path = Path(file_path)
@@ -486,11 +620,84 @@ def get_metrics_data():
     return result
 
 
-def get_inference_samples():
-    samples = []
-    log_path = SCRIPT_DIR / "../train.log"
+def draw_dataset_ratio_pie(ratio_dict):
+    """Draw pie chart from event:dataset ratio fields (e.g. novelRatio, wikiRatio). Values are percentages."""
+    if not ratio_dict:
+        return None
+    labels = []
+    values = []
+    for k, v in ratio_dict.items():
+        if not isinstance(v, (int, float)):
+            continue
+        labels.append(k[0].upper() + k[1:] if len(k) > 1 else k.upper())
+        values.append(max(float(v), 1e-10))
+    if not values:
+        return None
+    total = sum(values)
+    sizes = [v / total for v in values] if total > 0 else values
+    fig, ax = plt.subplots(figsize=(8, 6))
+    colors = plt.cm.Set3(range(len(labels)))
+    ax.pie(sizes, labels=labels, autopct="%1.1f%%", colors=colors, startangle=90)
+    ax.axis("equal")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+    buf.seek(0)
+    img_base64 = base64.b64encode(buf.read()).decode("utf-8")
+    plt.close(fig)
+    return img_base64
+
+
+def get_dataset_data():
+    """Get event:dataset data for Dataset tab from config_metrics."""
+    result = []
+    ratio_dict = {}
+    for m in config_metrics:
+        if m.get("event") != "dataset":
+            continue
+        file_path = m.get("file", "")
+        path = Path(file_path)
+        if not path.is_absolute():
+            path = SCRIPT_DIR / path
+        if not path.exists():
+            continue
+        event_name = "dataset"
+        skip_fields = {"event"}
+        seen_keys = set()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        if data.get("event") == event_name:
+                            for key, val in data.items():
+                                if key in skip_fields or key in seen_keys:
+                                    continue
+                                seen_keys.add(key)
+                                result.append(
+                                    {
+                                        "title": key[0].upper() + key[1:],
+                                        "value": format_value(val),
+                                    }
+                                )
+                                if "ratio" in key.lower() and isinstance(val, (int, float)):
+                                    ratio_dict[key] = val
+                    except json.JSONDecodeError:
+                        continue
+        except Exception:
+            pass
+    pie_base64 = draw_dataset_ratio_pie(ratio_dict) if ratio_dict else None
+    return {"metrics": result, "pie_base64": pie_base64}
+
+
+def get_dataset_metrics_data():
+    """Get event:metrics data for Dataset tab. Returns latest metrics and pie chart as base64."""
+    log_path = SCRIPT_DIR.parent / "train.log"
+    latest_metrics = {}
     if not log_path.exists():
-        return samples
+        return {"metrics": [], "pie_base64": None}
     try:
         with open(log_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -499,17 +706,127 @@ def get_inference_samples():
                     continue
                 try:
                     data = json.loads(line)
-                    if "idx" not in data or data["idx"] != 0:
+                    if data.get("event") != "metrics":
                         continue
-                    if "input" in data and "output" in data:
-                        samples.append(
-                            {"input": data["input"], "output": data["output"]}
-                        )
+                    for k, v in data.items():
+                        if k in ("event", "step"):
+                            continue
+                        if isinstance(v, (int, float)):
+                            latest_metrics[k] = v
                 except json.JSONDecodeError:
                     continue
-    except:
+    except Exception:
         pass
-    return samples[-10:] if len(samples) > 10 else samples
+
+    metrics_list = [{"title": k[0].upper() + k[1:], "value": format_value(v)} for k, v in latest_metrics.items()]
+    pie_base64 = draw_metrics_pie(latest_metrics) if latest_metrics else None
+    return {"metrics": metrics_list, "pie_base64": pie_base64}
+
+
+def draw_metrics_pie(metrics_dict):
+    """Draw pie chart of metrics (ratio = normalized values)."""
+    skip = {"event", "step"}
+    labels = []
+    values = []
+    for k, v in metrics_dict.items():
+        if k in skip or not isinstance(v, (int, float)):
+            continue
+        labels.append(k[0].upper() + k[1:])
+        values.append(max(float(v), 1e-10))
+    if not values:
+        return None
+    total = sum(values)
+    sizes = [v / total for v in values]
+    fig, ax = plt.subplots(figsize=(8, 6))
+    colors = plt.cm.Set3(range(len(labels)))
+    ax.pie(sizes, labels=labels, autopct="%1.1f%%", colors=colors, startangle=90)
+    ax.axis("equal")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+    buf.seek(0)
+    img_base64 = base64.b64encode(buf.read()).decode("utf-8")
+    plt.close(fig)
+    return img_base64
+
+
+def get_eta_data():
+    """Compute training ETA from train.log using throughput + step + config + dataset info."""
+    log_path = SCRIPT_DIR.parent / "train.log"
+    if not log_path.exists():
+        return None
+
+    config_evt = {}
+    dataset_evt = {}
+    latest_metrics = {}
+
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    ev = data.get("event")
+                    if ev == "config":
+                        config_evt = data
+                    elif ev == "dataset":
+                        dataset_evt = data
+                    elif ev == "metrics":
+                        latest_metrics = data
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        return None
+
+    throughput   = latest_metrics.get("throughpt")
+    current_step = latest_metrics.get("step")
+    batch_size   = config_evt.get("batchSize")
+    max_window   = config_evt.get("maxWindowSize")
+    world_size   = config_evt.get("worldSize")
+    num_epoch    = config_evt.get("numEpoch")
+    train_chunks = dataset_evt.get("trainChunks")
+    if not train_chunks:
+        train_chunks = sum(v for k, v in dataset_evt.items() if k.endswith("Chunks") and isinstance(v, (int, float)))
+
+    if not all([throughput, current_step, batch_size, max_window, world_size, num_epoch, train_chunks]):
+        return None
+    if throughput <= 0:
+        return None
+
+    # steps counted per-rank; DistributedSampler splits trainChunks across worldSize
+    steps_per_epoch = train_chunks / (batch_size * world_size)
+    total_steps     = steps_per_epoch * num_epoch
+    remaining_steps = max(0.0, total_steps - current_step)
+
+    # throughput = batchSize * maxWindowSize * worldSize * stepInterval / time  →  tokens/s
+    tokens_per_step  = batch_size * max_window * world_size
+    eta_seconds      = remaining_steps * tokens_per_step / throughput
+    progress         = min(100.0, current_step / total_steps * 100) if total_steps > 0 else 0.0
+
+    def fmt_dur(secs):
+        secs = int(secs)
+        if secs < 60:
+            return f"{secs}s"
+        elif secs < 3600:
+            return f"{secs // 60}m {secs % 60}s"
+        elif secs < 86400:
+            h, m = secs // 3600, (secs % 3600) // 60
+            return f"{h}h {m}m"
+        else:
+            d, h = secs // 86400, (secs % 86400) // 3600
+            return f"{d}d {h}h"
+
+    finish_dt = datetime.fromtimestamp(time.time() + eta_seconds).strftime("%m-%d %H:%M")
+
+    return {
+        "progress":     round(progress, 2),
+        "current_step": int(current_step),
+        "total_steps":  int(total_steps),
+        "eta_str":      fmt_dur(eta_seconds),
+        "finish_time":  finish_dt,
+        "throughput":   int(throughput),
+    }
 
 
 def get_available_weights():
@@ -521,6 +838,16 @@ def get_available_weights():
             weights.append(
                 {"name": name, "path": str(path), "size": path.stat().st_size}
             )
+    return weights
+
+
+def get_resume_weights():
+    """List all .bin files in project root for resume dropdown, newest first."""
+    root = SCRIPT_DIR.parent
+    weights = []
+    for p in root.glob("*.bin"):
+        weights.append({"name": p.name, "path": str(p), "size": p.stat().st_size})
+    weights.sort(key=lambda w: Path(w["path"]).stat().st_mtime, reverse=True)
     return weights
 
 
@@ -620,6 +947,60 @@ def get_train_status():
     return "stopped"
 
 
+def get_process_uptime_seconds(pid):
+    """Get process uptime in seconds. Returns None on failure. No extra deps."""
+    try:
+        if sys.platform == "linux":
+            with open("/proc/uptime", "r") as f:
+                uptime_sec = float(f.read().split()[0])
+            with open(f"/proc/{pid}/stat", "r") as f:
+                stat = f.read()
+            # Field 22 is starttime (1-indexed); after ") " we have fields 3-22, so index 19
+            starttime = int(stat.split(")")[1].split()[19])
+            return uptime_sec - (starttime / 100)
+        elif sys.platform == "darwin":
+            r = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "etime="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if r.returncode != 0 or not r.stdout.strip():
+                return None
+            s = r.stdout.strip()
+            # Parse "1-02:30:45" or "02:30:45" or "30:45" or "45"
+            parts = s.split("-")
+            days = int(parts[0]) if len(parts) > 1 else 0
+            time_part = parts[-1]
+            t = [int(x) for x in time_part.split(":")]
+            if len(t) == 3:
+                h, m, s = t[0], t[1], t[2]
+            elif len(t) == 2:
+                h, m, s = 0, t[0], t[1]
+            else:
+                h, m, s = 0, 0, t[0]
+            return days * 86400 + h * 3600 + m * 60 + s
+    except Exception:
+        pass
+    return None
+
+
+def format_uptime(seconds):
+    """Format seconds as 'Xd Xh Xm' or 'Xh Xm' or 'Xm'."""
+    if seconds is None or seconds < 0:
+        return ""
+    d, h = divmod(int(seconds), 86400)
+    h, m = divmod(h, 3600)
+    m, s = divmod(m, 60)
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h:
+        parts.append(f"{h}h")
+    parts.append(f"{m}m")
+    return " ".join(parts)
+
+
 def find_existing_training_processes():
     """Find all scholar training processes running on the system"""
     training_processes = []
@@ -643,11 +1024,14 @@ def find_existing_training_processes():
                 for proc in processes:
                     cmdline = proc.get("CommandLine", "") or ""
                     if "main.py" in cmdline and "train" in cmdline:
+                        pid = proc["ProcessId"]
+                        uptime = get_process_uptime_seconds(pid)
                         training_processes.append(
                             {
-                                "pid": proc["ProcessId"],
+                                "pid": pid,
                                 "cmdline": cmdline,
                                 "status": "running",
+                                "uptime": format_uptime(uptime) if uptime else None,
                             }
                         )
         except Exception:
@@ -658,14 +1042,34 @@ def find_existing_training_processes():
             result = subprocess.run(
                 ["ps", "aux"], capture_output=True, text=True, timeout=5
             )
+            torchrun_procs = []
+            main_procs = []
             for line in result.stdout.strip().split("\n"):
-                if "main.py" in line and "train" in line and "grep" not in line:
+                if "grep" in line:
+                    continue
+                if "torchrun" in line or "torch.distributed.run" in line:
+                    if "train" in line:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            pid = int(parts[1])
+                            uptime = get_process_uptime_seconds(pid)
+                            torchrun_procs.append({
+                                "pid": pid, "cmdline": line,
+                                "status": "running",
+                                "uptime": format_uptime(uptime) if uptime else None,
+                            })
+                elif "main.py" in line and "train" in line:
                     parts = line.split()
                     if len(parts) >= 2:
                         pid = int(parts[1])
-                        training_processes.append(
-                            {"pid": pid, "cmdline": line, "status": "running"}
-                        )
+                        uptime = get_process_uptime_seconds(pid)
+                        main_procs.append({
+                            "pid": pid, "cmdline": line,
+                            "status": "running",
+                            "uptime": format_uptime(uptime) if uptime else None,
+                        })
+            # Prefer torchrun parent (multi-GPU); else single-GPU main.py
+            training_processes = torchrun_procs if torchrun_procs else main_procs
         except Exception:
             pass
 
@@ -729,10 +1133,9 @@ def load_model_for_inference(weight_path=None):
         if scholar_instance is not None and current_weight_path == weight_path:
             return scholar_instance
 
-        # Load model
+        # Predictor avoids torch.distributed (Scholar is for torchrun training only)
         config = scholar_module.createModelConfig()
-        scholar_instance = scholar_module.Scholar(config)
-        scholar_instance.model.loadWeights(weight_path)
+        scholar_instance = scholar_module.Predictor(config, weight_path)
         scholar_instance.model.eval()
         current_weight_path = weight_path
         return scholar_instance
@@ -753,12 +1156,15 @@ def api_charts():
     ratio = request.args.get("ratio", "100", type=int)
     if ratio < 10 or ratio > 100:
         ratio = 100
-    charts_data = [draw_single_chart(c, int(ratio)) for c in charts]
+    with _matplotlib_lock:
+        charts_data = [draw_single_chart(c, int(ratio)) for c in charts]
+        dataset_data = get_dataset_data()
     return jsonify(
         {
             "charts": charts_data,
-            "metrics": get_metrics_data(),
-            "samples": get_inference_samples(),
+            "config": get_config_data(),
+            "dataset": dataset_data,
+            "eta": get_eta_data(),
             "gpu_stats": get_gpu_stats(),
             "hash": get_data_hash() + f"_r{ratio}",
             "timestamp": datetime.now().isoformat(),
@@ -768,7 +1174,18 @@ def api_charts():
 
 @app.route("/api/save_all")
 def api_save_all():
-    img_data = draw_all_charts_combined()
+    try:
+        ratio = int(request.args.get("ratio", "100"))
+    except (TypeError, ValueError):
+        ratio = 100
+    if ratio < 10 or ratio > 100:
+        ratio = 100
+    try:
+        with _matplotlib_lock:
+            img_data = draw_all_charts_combined(ratio=ratio)
+    except Exception as e:
+        log.exception("save_all failed")
+        return jsonify({"error": str(e)}), 500
     if img_data:
         return Response(
             img_data,
@@ -782,7 +1199,9 @@ def api_save_all():
 
 @app.route("/api/train/status")
 def api_train_status():
-    return jsonify({"status": get_train_status()})
+    status = get_train_status()
+    gpu_count = len(get_gpu_stats()) or 1
+    return jsonify({"status": status, "gpu_count": gpu_count})
 
 
 @app.route("/api/train/start", methods=["POST"])
@@ -792,7 +1211,6 @@ def api_train_start():
     # First check if there are already training processes running
     existing_processes = find_existing_training_processes()
     if existing_processes:
-        # There's already a training process, but not tracked by us
         return (
             jsonify(
                 {
@@ -804,52 +1222,91 @@ def api_train_start():
         )
 
     resume = ""
+    mode = "single"
+    num_gpus = 1
+    gpu_ids = None
     if request.is_json and request.json:
         resume = request.json.get("resume", "")
+        mode = request.json.get("mode", "single")
+        num_gpus = int(request.json.get("num_gpus", 1))
+        gpu_ids = request.json.get("gpu_ids") or None
+        if gpu_ids and isinstance(gpu_ids, str):
+            gpu_ids = gpu_ids.strip() or None
+
     scholar_path = SCRIPT_DIR / "main.py"
     log_path = SCRIPT_DIR.parent / "stdout.log"
+
+    def parse_gpu_ids(s):
+        """Parse '8-15' or '0,1,2,3' or '8-10,12' into comma-separated list"""
+        if not s or not s.strip():
+            return None
+        out = []
+        for part in s.replace(" ", "").split(","):
+            if "-" in part:
+                a, b = part.split("-", 1)
+                try:
+                    lo, hi = int(a.strip()), int(b.strip())
+                    out.extend(range(lo, hi + 1))
+                except ValueError:
+                    pass
+            else:
+                try:
+                    out.append(int(part.strip()))
+                except ValueError:
+                    pass
+        return ",".join(map(str, sorted(set(out)))) if out else None
 
     try:
         log_file = open(log_path, "a", encoding="utf-8")
         log_file.write(f"\n{'='*50}\nTraining started at {datetime.now()}\n{'='*50}\n")
         log_file.flush()
 
-        # Unbuffered stdout so print() from child (e.g. dataloader) writes to log immediately
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        cuda_devices = parse_gpu_ids(gpu_ids) if gpu_ids else None
+        if cuda_devices:
+            env["CUDA_VISIBLE_DEVICES"] = cuda_devices
+        start_new_session = sys.platform != "win32"
+        creationflags = (
+            (
+                subprocess.DETACHED_PROCESS
+                | subprocess.CREATE_NO_WINDOW
+                | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+            if sys.platform == "win32"
+            else 0
+        )
 
-        if resume:
+        if mode == "multi" and num_gpus > 1:
+            # Multi-GPU: use torchrun
+            cmd = [
+                sys.executable, "-m", "torch.distributed.run",
+                "--nproc_per_node", str(num_gpus),
+                str(scholar_path), "train"
+            ]
+            if resume:
+                cmd.append(resume)
             train_process = subprocess.Popen(
-                [sys.executable, str(scholar_path), "train", resume],
+                cmd,
                 cwd=str(SCRIPT_DIR.parent),
                 env=env,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
-                creationflags=(
-                    (
-                        subprocess.DETACHED_PROCESS
-                        | subprocess.CREATE_NO_WINDOW
-                        | subprocess.CREATE_NEW_PROCESS_GROUP
-                    )
-                    if sys.platform == "win32"
-                    else 0
-                ),
+                start_new_session=start_new_session,
+                creationflags=creationflags,
             )
         else:
+            # Single GPU: python main.py train
+            cmd = [sys.executable, str(scholar_path), "train"]
+            if resume:
+                cmd.append(resume)
             train_process = subprocess.Popen(
-                [sys.executable, str(scholar_path), "train"],
+                cmd,
                 cwd=str(SCRIPT_DIR.parent),
                 env=env,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
-                creationflags=(
-                    (
-                        subprocess.DETACHED_PROCESS
-                        | subprocess.CREATE_NO_WINDOW
-                        | subprocess.CREATE_NEW_PROCESS_GROUP
-                    )
-                    if sys.platform == "win32"
-                    else 0
-                ),
+                start_new_session=start_new_session,
+                creationflags=creationflags,
             )
         return jsonify({"status": "started", "pid": train_process.pid})
     except Exception as e:
@@ -885,11 +1342,19 @@ def api_train_stop():
                 capture_output=True,
             )
         else:
-            train_process.terminate()
-            train_process.wait(timeout=5)
+            try:
+                os.killpg(os.getpgid(train_process.pid), signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                train_process.terminate()
+            try:
+                train_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                train_process.kill()
     except Exception:
-        # Force kill if terminate fails
-        train_process.kill()
+        try:
+            train_process.kill()
+        except Exception:
+            pass
 
     train_process = None
     return jsonify({"status": "stopped"})
@@ -897,14 +1362,21 @@ def api_train_stop():
 
 @app.route("/api/train/kill/<int:pid>", methods=["POST"])
 def api_train_kill(pid):
-    """Kill a specific training process by PID"""
+    """Kill a specific training process by PID (and its process group for torchrun)"""
+    global train_process
     try:
         if sys.platform == "win32":
             subprocess.run(
-                ["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=5,
             )
         else:
-            os.kill(pid, signal.SIGTERM)
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                os.kill(pid, signal.SIGTERM)
+        if train_process and train_process.pid == pid:
+            train_process = None
         return jsonify({"status": "killed", "pid": pid})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -915,10 +1387,14 @@ def api_weights():
     return jsonify({"weights": get_available_weights()})
 
 
+@app.route("/api/resume-weights")
+def api_resume_weights():
+    return jsonify({"weights": get_resume_weights()})
+
+
 @app.route("/api/infer", methods=["POST"])
 def api_infer():
     """Run inference with Inspector tracing"""
-    global scholar_instance
     data = request.json
     text = data.get("text", "").strip()
     if not text:
@@ -928,17 +1404,20 @@ def api_infer():
     weight_path = data.get("weight")
     if weight_path:
         weight_path = str(SCRIPT_DIR.parent / weight_path)
+    else:
+        weight_path = str(SCRIPT_DIR.parent / "scholar_best.bin")
 
     try:
         import scholar as scholar_module
 
-        # Load model
-        config = scholar_module.createModelConfig()
-        instance = scholar_module.Scholar(config)
-        instance.model.loadWeights(
-            weight_path or str(SCRIPT_DIR.parent / "scholar_best.bin")
-        )
-        instance.model.eval()
+        original_cwd = os.getcwd()
+        os.chdir(str(SCRIPT_DIR.parent))
+        try:
+            config = scholar_module.createModelConfig()
+            instance = scholar_module.Predictor(config, weight_path)
+            instance.model.eval()
+        finally:
+            os.chdir(original_cwd)
 
         # Enable debug mode
         scholar_module.IsDebug = debug
@@ -958,13 +1437,20 @@ def api_infer():
 
         return jsonify({"input": text, "output": output, "inspector": inspector_output})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        tb = traceback.format_exc()
+        return jsonify({"error": str(e), "traceback": tb}), 500
 
 
 @app.route("/api/inspect")
 def api_inspect():
     """Get parsed inspect.log data"""
     return jsonify({"layers": parse_inspect_log()})
+
+
+@app.route("/api/device")
+def api_device():
+    """Get device stats: disk, memory, GPU, CPU"""
+    return jsonify(get_device_stats())
 
 
 @app.route("/api/logs")
@@ -1097,12 +1583,15 @@ def build_html():
         .header-left {{ display: flex; align-items: center; gap: 12px; }}
         .header-logo {{ width: 32px; height: 32px; object-fit: contain; }}
         .header h1 {{ font-size: 1.2rem; font-weight: 600; color: #333; }}
-        .train-status {{ display: flex; align-items: center; gap: 8px; padding: 8px 16px; border-radius: 4px; font-size: 0.85rem; }}
+        .train-status {{ display: flex; align-items: center; gap: 8px; font-size: 0.85rem; }}
         .train-status .dot {{ width: 8px; height: 8px; border-radius: 50%; }}
-        .train-status.running {{ background: #f6ffed; color: #52c41a; }}
+        .train-status.running {{ color: #52c41a; }}
         .train-status.running .dot {{ background: #52c41a; animation: pulse 2s infinite; }}
-        .train-status.stopped {{ background: #fff2f0; color: #ff4d4f; }}
+        .train-status.stopped {{ color: #ff4d4f; }}
         .train-status.stopped .dot {{ background: #ff4d4f; }}
+        .train-status-badge {{ padding: 6px 12px; border-radius: 4px; font-size: 0.8rem; border: 1px solid #e8e8e8; background: #fafafa; color: #666; }}
+        .train-status.running .train-status-badge {{ background: #f6ffed; border-color: #b7eb8f; color: #52c41a; }}
+        .train-status.stopped .train-status-badge {{ background: #fff2f0; border-color: #ffccc7; color: #ff4d4f; }}
         @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.5; }} }}
         /* Main Layout with Sidebar */
         .app-layout {{ display: flex; min-height: calc(100vh - 57px); }}
@@ -1118,6 +1607,22 @@ def build_html():
         .training-tab-content.active {{ display: block; }}
         .inference-sub-content {{ display: none; }}
         .inference-sub-content.active {{ display: block; }}
+        /* Device monitor styles */
+        .device-layout {{ padding: 16px; }}
+        .device-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }}
+        .device-card {{ background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px; }}
+        .device-card h3 {{ font-size: 0.9rem; color: #333; margin-bottom: 12px; font-weight: 600; border-bottom: 1px solid #f0f0f0; padding-bottom: 8px; }}
+        .device-content {{ font-size: 0.85rem; color: #666; line-height: 1.6; }}
+        .device-row {{ display: flex; justify-content: space-between; margin-bottom: 6px; }}
+        .device-row:last-child {{ margin-bottom: 0; }}
+        .device-bar {{ height: 8px; background: #f0f0f0; border-radius: 4px; margin: 8px 0; overflow: hidden; }}
+        .device-bar-fill {{ height: 100%; background: linear-gradient(90deg, #52c41a, #1890ff); border-radius: 4px; transition: width 0.3s; }}
+        .device-bar-fill.warn {{ background: linear-gradient(90deg, #faad14, #ff7a45); }}
+        .device-bar-fill.danger {{ background: linear-gradient(90deg, #ff4d4f, #ff7875); }}
+        .device-gpu-item {{ padding: 12px; margin-bottom: 8px; background: #fafafa; border-radius: 6px; border: 1px solid #e8e8e8; }}
+        .device-gpu-item:last-child {{ margin-bottom: 0; }}
+        .device-gpu-name {{ font-size: 0.8rem; color: #666; margin-bottom: 4px; }}
+        
         /* Log viewer styles */
         .log-layout {{ display: flex; gap: 16px; height: calc(100vh - 220px); }}
         .log-sidebar {{ width: 240px; flex-shrink: 0; background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px; overflow-y: auto; }}
@@ -1181,12 +1686,15 @@ def build_html():
         .similar-token.rank-3 .score {{ color: #1890ff; }}
         .similar-token .score {{ color: #1890ff; font-size: 1.2rem; }}
         .no-logs {{ color: #999; text-align: center; padding: 40px; font-size: 0.9rem; }}
-        .train-status {{ display: flex; align-items: center; gap: 8px; padding: 8px 16px; border-radius: 4px; font-size: 0.85rem; }}
+        .train-status {{ display: flex; align-items: center; gap: 8px; font-size: 0.85rem; }}
         .train-status .dot {{ width: 8px; height: 8px; border-radius: 50%; }}
-        .train-status.running {{ background: #f6ffed; color: #52c41a; }}
+        .train-status.running {{ color: #52c41a; }}
         .train-status.running .dot {{ background: #52c41a; animation: pulse 2s infinite; }}
-        .train-status.stopped {{ background: #fff2f0; color: #ff4d4f; }}
+        .train-status.stopped {{ color: #ff4d4f; }}
         .train-status.stopped .dot {{ background: #ff4d4f; }}
+        .train-status-badge {{ padding: 6px 12px; border-radius: 4px; font-size: 0.8rem; border: 1px solid #e8e8e8; background: #fafafa; color: #666; }}
+        .train-status.running .train-status-badge {{ background: #f6ffed; border-color: #b7eb8f; color: #52c41a; }}
+        .train-status.stopped .train-status-badge {{ background: #fff2f0; border-color: #ffccc7; color: #ff4d4f; }}
         @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.5; }} }}
         .main {{ padding: 20px; max-width: 1800px; margin: 0 auto; }}
         .page {{ display: none; }}
@@ -1197,6 +1705,12 @@ def build_html():
         .dashboard-sidebar {{ width: 280px; flex-shrink: 0; }}
         .charts-area {{ flex: 1; min-width: 0; }}
         .charts-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(450px, 1fr)); gap: 16px; }}
+        .dataset-layout {{ display: flex; gap: 20px; flex: 1; min-width: 0; }}
+        .dataset-info {{ width: 280px; flex-shrink: 0; }}
+        .dataset-charts {{ flex: 1; min-width: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; align-content: start; }}
+        .dataset-chart-item {{ background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden; }}
+        .dataset-chart-item .chart-title {{ padding: 12px 16px; font-size: 0.85rem; color: #666; font-weight: 500; border-bottom: 1px solid #f0f0f0; }}
+        .dataset-chart-item .chart-body {{ padding: 16px; text-align: center; }}
         .sidebar {{ width: 280px; flex-shrink: 0; }}
         .metrics-card, .gpu-card, .samples-card, .control-card {{ background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; margin-bottom: 16px; }}
         .metrics-header, .gpu-header, .samples-header {{ display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; cursor: pointer; user-select: none; }}
@@ -1224,18 +1738,15 @@ def build_html():
         @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
         .toast {{ position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(100px); background: #52c41a; color: #fff; padding: 10px 20px; border-radius: 4px; font-size: 0.85rem; opacity: 0; transition: all 0.3s ease; z-index: 1000; }}
         .toast.show {{ transform: translateX(-50%) translateY(0); opacity: 1; }}
-        .gpu-item {{ padding: 8px 0; border-bottom: 1px solid #f0f0f0; }}
-        .gpu-item:last-child {{ border-bottom: none; }}
-        .gpu-name {{ font-size: 0.8rem; color: #1890ff; font-weight: 500; margin-bottom: 6px; }}
-        .gpu-stats {{ display: flex; flex-wrap: wrap; gap: 8px; }}
-        .gpu-stat {{ flex: 1; min-width: 80px; }}
-        .gpu-stat-label {{ font-size: 0.7rem; color: #999; }}
-        .gpu-stat-value {{ font-size: 0.85rem; font-weight: 600; color: #333; }}
-        .gpu-bar {{ height: 4px; background: #f0f0f0; border-radius: 2px; margin-top: 2px; }}
-        .gpu-bar-fill {{ height: 100%; border-radius: 2px; transition: width 0.3s; }}
-        .gpu-bar-fill.util {{ background: linear-gradient(90deg, #52c41a, #faad14, #f5222d); }}
-        .gpu-bar-fill.mem {{ background: linear-gradient(90deg, #1890ff, #722ed1); }}
-        .no-gpu {{ padding: 16px; text-align: center; color: #999; font-size: 0.8rem; }}
+        .gpu-bar-row {{ display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 0.75rem; }}
+        .gpu-bar-row:last-child {{ margin-bottom: 0; }}
+        .gpu-bar-idx {{ width: 20px; color: #666; font-weight: 600; flex-shrink: 0; }}
+        .gpu-bar-track {{ flex: 1; height: 6px; background: #f0f0f0; border-radius: 3px; overflow: hidden; min-width: 60px; }}
+        .gpu-bar-fill {{ height: 100%; border-radius: 3px; background: linear-gradient(90deg, #1890ff, #722ed1); transition: width 0.3s; }}
+        .gpu-bar-fill.warn {{ background: linear-gradient(90deg, #faad14, #ff7a45); }}
+        .gpu-bar-fill.danger {{ background: linear-gradient(90deg, #ff4d4f, #ff7875); }}
+        .gpu-bar-val {{ width: 48px; text-align: right; color: #666; font-size: 0.7rem; flex-shrink: 0; }}
+        .no-gpu {{ padding: 12px; text-align: center; color: #999; font-size: 0.75rem; }}
         .samples-content {{ max-height: 280px; overflow-y: auto; }}
         .sample-item {{ padding: 10px 16px; border-bottom: 1px solid #f0f0f0; }}
         .sample-item:last-child {{ border-bottom: none; }}
@@ -1245,12 +1756,30 @@ def build_html():
         .control-card {{ padding: 16px; }}
         .control-card h3 {{ font-size: 0.85rem; color: #666; font-weight: 500; margin: 0 0 12px 0; }}
         .control-btns {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+        .eta-card {{ background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; margin-bottom: 16px; padding: 16px; }}
+        .eta-card h3 {{ font-size: 0.85rem; color: #666; font-weight: 500; margin: 0 0 12px 0; }}
+        .eta-progress-bar {{ width: 100%; height: 6px; background: #f0f0f0; border-radius: 3px; overflow: hidden; margin-bottom: 10px; }}
+        .eta-progress-fill {{ height: 100%; background: linear-gradient(90deg, #1890ff, #36cfc9); border-radius: 3px; transition: width 0.6s ease; }}
+        .eta-rows {{ display: flex; flex-direction: column; gap: 6px; }}
+        .eta-row {{ display: flex; justify-content: space-between; align-items: center; font-size: 0.78rem; }}
+        .eta-label {{ color: #999; }}
+        .eta-value {{ color: #333; font-weight: 500; font-variant-numeric: tabular-nums; }}
+        .eta-value.highlight {{ color: #1890ff; font-size: 0.9rem; }}
+        .eta-no-data {{ text-align: center; color: #999; font-size: 0.8rem; padding: 8px 0; }}
         .ctrl-btn {{ flex: 1; min-width: 80px; padding: 10px 12px; border-radius: 4px; cursor: pointer; font-size: 0.8rem; display: flex; align-items: center; justify-content: center; gap: 4px; border: none; }}
         .ratio-slider {{ width: 100%; height: 6px; border-radius: 3px; background: #f0f0f0; outline: none; -webkit-appearance: none; }}
         .ratio-slider::-webkit-slider-thumb {{ -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #1890ff; cursor: pointer; transition: background 0.2s; }}
         .ratio-slider::-webkit-slider-thumb:hover {{ background: #40a9ff; }}
         .ratio-slider::-moz-range-thumb {{ width: 16px; height: 16px; border-radius: 50%; background: #1890ff; cursor: pointer; border: none; transition: background 0.2s; }}
         .ratio-slider::-moz-range-thumb:hover {{ background: #40a9ff; }}
+        .train-gpu-mode {{ margin-bottom: 4px; }}
+        .gpu-num-row {{ margin-top: 0; }}
+        .gpu-dots-row {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }}
+        .gpu-dot {{ width: 28px; height: 28px; border-radius: 4px; background: #52c41a; color: #fff; border: 2px solid transparent; display: flex; align-items: center; justify-content: center; font-size: 0.75rem; font-weight: 600; cursor: pointer; transition: all 0.2s; flex-shrink: 0; }}
+        .gpu-dot:hover {{ background: #73d13d; transform: scale(1.08); }}
+        .gpu-dot.in-range {{ background: #1890ff; border-color: #096dd9; color: #fff; }}
+        .gpu-dot.selected {{ background: #096dd9; border-color: #0050b3; box-shadow: 0 0 0 2px rgba(24,144,255,0.5); color: #fff; }}
+        .gpu-dots-hint {{ font-size: 0.7rem; color: #999; margin-top: 6px; }}
         .ctrl-btn.start {{ background: #52c41a; color: #fff; }}
         .ctrl-btn.start:hover {{ background: #73d13d; }}
         .ctrl-btn.stop {{ background: #ff4d4f; color: #fff; }}
@@ -1259,6 +1788,14 @@ def build_html():
         .ctrl-btn.save:hover {{ background: #40a9ff; }}
         .ctrl-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
         .ctrl-btn svg {{ width: 16px; height: 16px; }}
+        .resume-dropdown {{ position: relative; display: inline-flex; }}
+        .resume-dropdown .ctrl-btn {{ min-width: 90px; }}
+        .resume-dropdown .dropdown-arrow {{ font-size: 0.65rem; margin-left: 2px; opacity: 0.9; }}
+        .resume-dropdown-menu {{ position: absolute; top: 100%; left: 0; margin-top: 4px; background: #fff; border: 1px solid #e8e8e8; border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); z-index: 100; min-width: 180px; max-height: 240px; overflow-y: auto; }}
+        .resume-dropdown-item {{ display: block; width: 100%; padding: 8px 12px; border: none; background: none; text-align: left; font-size: 0.8rem; cursor: pointer; color: #333; }}
+        .resume-dropdown-item:hover {{ background: #f5f5f5; }}
+        .resume-dropdown-item:disabled {{ color: #999; cursor: not-allowed; }}
+        .resume-dropdown-empty {{ padding: 12px; font-size: 0.8rem; color: #999; }}
         /* Inference page styles */
         .infer-layout {{ display: flex; gap: 20px; height: calc(100vh - 140px); }}
         .infer-sidebar {{ width: 280px; flex-shrink: 0; background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px; }}
@@ -1274,7 +1811,7 @@ def build_html():
         .chat-area {{ flex: 1; padding: 16px; overflow-y: auto; }}
         .chat-msg {{ margin-bottom: 16px; display: flex; align-items: flex-start; gap: 10px; }}
         .chat-msg.user {{ flex-direction: row-reverse; }}
-        .chat-avatar {{ width: 36px; height: 36px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 1.4rem; }}
+        .chat-avatar {{ width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 1.4rem; }}
         .chat-msg.user .chat-avatar {{ background: #e6f7ff; }}
         .chat-msg.assistant .chat-avatar {{ background: #fff; border: 1px solid #e0e0e0; }}
         .chat-msg.assistant .chat-avatar img {{ width: 24px; height: 24px; object-fit: contain; }}
@@ -1302,7 +1839,9 @@ def build_html():
         </div>
         <div class="train-status stopped" id="train-status">
             <span class="dot"></span>
-            <span id="train-status-text">Stopped</span>
+            <span class="train-status-badge" id="train-status-badge">Status: Stopped</span>
+            <span class="train-status-badge" id="train-pid-badge" style="display: none;">Pid: -</span>
+            <span class="train-status-badge" id="train-uptime-badge" style="display: none;">Uptime: -</span>
         </div>
     </div>
     <div class="app-layout">
@@ -1310,7 +1849,9 @@ def build_html():
         <div class="side-nav">
             <div class="side-nav-title">Training</div>
             <button class="side-nav-btn active" onclick="switchSubTab('training', 'training-tab-training', this)">Training</button>
-            <button class="side-nav-btn" onclick="switchSubTab('training', 'training-tab-metrics', this)">Metrics</button>
+            <button class="side-nav-btn" onclick="switchSubTab('training', 'training-tab-dataset', this)">Dataset</button>
+            <button class="side-nav-btn" onclick="switchSubTab('training', 'training-tab-config', this)">Config</button>
+            <button class="side-nav-btn" onclick="switchSubTab('training', 'training-tab-device', this)">Device</button>
             <button class="side-nav-btn" onclick="switchSubTab('training', 'training-tab-log', this)">Log</button>
             
             <div class="side-nav-title" style="margin-top: 24px;">Inference</div>
@@ -1327,15 +1868,25 @@ def build_html():
                         <div class="dashboard-sidebar">
                             <div class="control-card">
                                 <h3>Training Control</h3>
-                                <div class="control-btns">
+                                <div class="train-gpu-mode" id="train-gpu-mode">
+                                    <div class="gpu-num-row" id="gpu-num-row">
+                                        <div style="font-size: 0.8rem; color: #666; margin-bottom: 4px;">Select GPU(s)</div>
+                                        <div class="gpu-dots-row" id="gpu-dots-row"></div>
+                                        <div class="gpu-dots-hint" id="gpu-dots-hint">单击选单卡，点起始+结束选多卡</div>
+                                    </div>
+                                </div>
+                                <div class="control-btns" style="margin-top: 12px;">
                                     <button class="ctrl-btn start" id="btn-start" onclick="startTrain()">
                                         <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
                                         Start
                                     </button>
-                                    <button class="ctrl-btn resume" id="btn-resume" onclick="resumeTrain()" style="background: #faad14; border-color: #faad14;">
-                                        <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
-                                        Resume
-                                    </button>
+                                    <div class="resume-dropdown">
+                                        <button class="ctrl-btn resume" id="btn-resume" onclick="toggleResumeDropdown('resume')" style="background: #faad14; border-color: #faad14;">
+                                            <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+                                            Resume <span class="dropdown-arrow">▼</span>
+                                        </button>
+                                        <div class="resume-dropdown-menu" id="resume-dropdown-menu"></div>
+                                    </div>
                                     <button class="ctrl-btn stop" id="btn-stop" onclick="stopTrain()" disabled>
                                         <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12"/></svg>
                                         Stop
@@ -1363,6 +1914,10 @@ def build_html():
                                     </button>
                                 </div>
                             </div>
+                            <div class="eta-card" id="eta-card">
+                                <h3>Training ETA</h3>
+                                <div id="eta-content"><div class="eta-no-data">No Data</div></div>
+                            </div>
                             <div class="samples-card">
                                 <div class="samples-header" onclick="toggleSection('processes')">
                                     <h3>Training Processes</h3>
@@ -1377,44 +1932,131 @@ def build_html():
                                 </div>
                                 <div class="gpu-content" id="gpu-content"></div>
                             </div>
-                            <div class="samples-card">
-                                <div class="samples-header" onclick="toggleSection('samples')">
-                                    <h3>Inference Samples</h3>
-                                    <span class="samples-toggle" id="samples-toggle">▼</span>
-                                </div>
-                                <div class="samples-content" id="samples-content"></div>
-                            </div>
                         </div>
                     </div>
                 </div>
                 
-                <div class="training-tab-content" id="training-tab-metrics">
+                <div class="training-tab-content" id="training-tab-dataset">
                     <div class="dashboard-layout">
-                        <div class="dashboard-content">
-                            <div class="metrics-card" style="margin-bottom: 0;">
-                                <div class="metrics-header">
-                                    <h3>All Metrics</h3>
+                        <div class="dataset-layout" style="flex: 1; min-width: 0;">
+                            <div class="dataset-info">
+                                <div class="metrics-card" style="margin-bottom: 0;">
+                                    <div class="metrics-header">
+                                        <h3>Dataset (event:dataset)</h3>
+                                    </div>
+                                    <div class="metrics-content" id="dataset-metrics-container" style="border-top: none; padding: 16px;"></div>
                                 </div>
-                                <div class="metrics-content" id="metrics-container" style="border-top: none; padding: 16px;"></div>
+                            </div>
+                            <div class="dataset-charts">
+                                <div class="dataset-chart-item">
+                                    <div class="chart-title">Ratio</div>
+                                    <div class="chart-body" id="dataset-pie-container"></div>
+                                </div>
                             </div>
                         </div>
                         <div class="dashboard-sidebar">
                             <div class="control-card">
                                 <h3>Training Control</h3>
                                 <div class="control-btns">
-                                    <button class="ctrl-btn start" id="btn-start-metrics" onclick="startTrain()">
+                                    <button class="ctrl-btn start" id="btn-start-dataset" onclick="startTrain()">
                                         <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
                                         Start
                                     </button>
-                                    <button class="ctrl-btn resume" id="btn-resume-metrics" onclick="resumeTrain()" style="background: #faad14; border-color: #faad14;">
-                                        <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
-                                        Resume
-                                    </button>
-                                    <button class="ctrl-btn stop" id="btn-stop-metrics" onclick="stopTrain()" disabled>
+                                    <div class="resume-dropdown">
+                                        <button class="ctrl-btn resume" id="btn-resume-dataset" onclick="toggleResumeDropdown('resume-dataset')" style="background: #faad14; border-color: #faad14;">
+                                            <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+                                            Resume <span class="dropdown-arrow">▼</span>
+                                        </button>
+                                        <div class="resume-dropdown-menu" id="resume-dropdown-menu-dataset"></div>
+                                    </div>
+                                    <button class="ctrl-btn stop" id="btn-stop-dataset" onclick="stopTrain()" disabled>
                                         <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12"/></svg>
                                         Stop
                                     </button>
                                 </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="training-tab-content" id="training-tab-config">
+                    <div class="dashboard-layout">
+                        <div class="dashboard-content">
+                            <div class="metrics-card" style="margin-bottom: 0;">
+                                <div class="metrics-header">
+                                    <h3>Config (event:config)</h3>
+                                </div>
+                                <div class="metrics-content" id="config-container" style="border-top: none; padding: 16px;"></div>
+                            </div>
+                        </div>
+                        <div class="dashboard-sidebar">
+                            <div class="control-card">
+                                <h3>Training Control</h3>
+                                <div class="control-btns">
+                                    <button class="ctrl-btn start" id="btn-start-config" onclick="startTrain()">
+                                        <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+                                        Start
+                                    </button>
+                                    <div class="resume-dropdown">
+                                        <button class="ctrl-btn resume" id="btn-resume-config" onclick="toggleResumeDropdown('resume-config')" style="background: #faad14; border-color: #faad14;">
+                                            <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+                                            Resume <span class="dropdown-arrow">▼</span>
+                                        </button>
+                                        <div class="resume-dropdown-menu" id="resume-dropdown-menu-config"></div>
+                                    </div>
+                                    <button class="ctrl-btn stop" id="btn-stop-config" onclick="stopTrain()" disabled>
+                                        <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12"/></svg>
+                                        Stop
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="training-tab-content" id="training-tab-device">
+                    <div class="dashboard-layout">
+                        <div class="device-layout" style="flex: 1; min-width: 0;">
+                            <div class="device-grid">
+                            <div class="device-card">
+                                <h3>Disk</h3>
+                                <div class="device-content" id="device-disk"></div>
+                            </div>
+                            <div class="device-card">
+                                <h3>Memory</h3>
+                                <div class="device-content" id="device-memory"></div>
+                            </div>
+                            <div class="device-card">
+                                <h3>CPU</h3>
+                                <div class="device-content" id="device-cpu"></div>
+                            </div>
+                            <div class="device-card">
+                                <h3>GPU</h3>
+                                <div class="device-content" id="device-gpu"></div>
+                            </div>
+                        </div>
+                        </div>
+                        <div class="dashboard-sidebar">
+                            <div class="control-card">
+                                <h3>Training Control</h3>
+                                <div class="control-btns">
+                                    <button class="ctrl-btn start" id="btn-start-device" onclick="startTrain()">
+                                        <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+                                        Start
+                                    </button>
+                                    <div class="resume-dropdown">
+                                        <button class="ctrl-btn resume" id="btn-resume-device" onclick="toggleResumeDropdown('resume-device')" style="background: #faad14; border-color: #faad14;">
+                                            <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+                                            Resume <span class="dropdown-arrow">▼</span>
+                                        </button>
+                                        <div class="resume-dropdown-menu" id="resume-dropdown-menu-device"></div>
+                                    </div>
+                                    <button class="ctrl-btn stop" id="btn-stop-device" onclick="stopTrain()" disabled>
+                                        <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12"/></svg>
+                                        Stop
+                                    </button>
+                                </div>
+                                <div style="font-size: 0.75rem; color: #999; margin-top: 12px;">Auto-refresh: 2s</div>
                             </div>
                         </div>
                     </div>
@@ -1578,6 +2220,8 @@ def build_html():
         let currentLogPath = null;
         let currentRatio = 100;
         let ratioFetchTimeout = null;
+        let devicePollTimer = null;
+        const devicePollInterval = 2000;
         
         function handleRatioChange(value) {{
             currentRatio = parseInt(value);
@@ -1611,6 +2255,92 @@ def build_html():
             // Load logs if switching to log tab
             if (contentId === 'training-tab-log') {{
                 loadLogFiles();
+            }}
+            // Device tab: start polling; stop when leaving
+            if (contentId === 'training-tab-device') {{
+                fetchDeviceStats();
+                if (devicePollTimer) clearInterval(devicePollTimer);
+                devicePollTimer = setInterval(fetchDeviceStats, devicePollInterval);
+            }} else if (devicePollTimer) {{
+                clearInterval(devicePollTimer);
+                devicePollTimer = null;
+            }}
+        }}
+        
+        async function fetchDeviceStats() {{
+            try {{
+                const response = await fetch('/api/device');
+                const data = await response.json();
+                
+                // Disk
+                const diskEl = document.getElementById('device-disk');
+                if (data.disk && data.disk.length > 0) {{
+                    diskEl.innerHTML = data.disk.map(d => {{
+                        const barClass = d.percent >= 90 ? 'danger' : (d.percent >= 75 ? 'warn' : '');
+                        return `
+                            <div class="device-row"><span>${{d.path}}</span></div>
+                            <div class="device-row"><span>Used</span><span>${{d.used_gb}} / ${{d.total_gb}} GB</span></div>
+                            <div class="device-bar"><div class="device-bar-fill ${{barClass}}" style="width: ${{d.percent}}%"></div></div>
+                            <div class="device-row"><span>Free</span><span>${{d.free_gb}} GB (${{(100-d.percent).toFixed(1)}}%)</span></div>
+                        `;
+                    }}).join('<hr style="margin: 12px 0; border: none; border-top: 1px solid #f0f0f0;">');
+                }} else {{
+                    diskEl.innerHTML = '<div class="no-samples">No disk data (install psutil)</div>';
+                }}
+                
+                // Memory
+                const memEl = document.getElementById('device-memory');
+                if (data.memory && Object.keys(data.memory).length > 0) {{
+                    const m = data.memory;
+                    const barClass = m.percent >= 90 ? 'danger' : (m.percent >= 75 ? 'warn' : '');
+                    memEl.innerHTML = `
+                        <div class="device-row"><span>Used</span><span>${{m.used_gb}} / ${{m.total_gb}} GB</span></div>
+                        <div class="device-bar"><div class="device-bar-fill ${{barClass}}" style="width: ${{m.percent}}%"></div></div>
+                        <div class="device-row"><span>Available</span><span>${{m.available_gb}} GB</span></div>
+                    `;
+                }} else {{
+                    memEl.innerHTML = '<div class="no-samples">No memory data</div>';
+                }}
+                
+                // CPU
+                const cpuEl = document.getElementById('device-cpu');
+                if (data.cpu && Object.keys(data.cpu).length > 0) {{
+                    const c = data.cpu;
+                    const barClass = c.percent >= 90 ? 'danger' : (c.percent >= 75 ? 'warn' : '');
+                    cpuEl.innerHTML = `
+                        <div class="device-row"><span>Usage</span><span>${{c.percent}}%</span></div>
+                        <div class="device-bar"><div class="device-bar-fill ${{barClass}}" style="width: ${{c.percent}}%"></div></div>
+                        <div class="device-row"><span>Cores</span><span>${{c.count}} physical / ${{c.count_logical}} logical</span></div>
+                    `;
+                }} else {{
+                    cpuEl.innerHTML = '<div class="no-samples">No CPU data</div>';
+                }}
+                
+                // GPU
+                const gpuEl = document.getElementById('device-gpu');
+                if (data.gpu && data.gpu.length > 0) {{
+                    gpuEl.innerHTML = data.gpu.map(g => {{
+                        const memPct = g.memory_total > 0 ? Math.round(g.memory_used / g.memory_total * 100) : 0;
+                        const barClass = memPct >= 90 ? 'danger' : (memPct >= 75 ? 'warn' : '');
+                        return `
+                            <div class="device-gpu-item">
+                                <div class="device-gpu-name">GPU ${{g.index}}: ${{g.name}}</div>
+                                <div class="device-row"><span>Util</span><span>${{g.utilization}}%</span></div>
+                                <div class="device-row"><span>Memory</span><span>${{g.memory_used}} / ${{g.memory_total}} MiB</span></div>
+                                <div class="device-bar"><div class="device-bar-fill ${{barClass}}" style="width: ${{memPct}}%"></div></div>
+                                <div class="device-row"><span>Temp</span><span>${{g.temperature}}°C</span></div>
+                            </div>
+                        `;
+                    }}).join('');
+                }} else {{
+                    gpuEl.innerHTML = '<div class="no-samples">No GPU detected</div>';
+                }}
+            }} catch (error) {{
+                console.error('Device stats error:', error);
+                ['device-disk','device-memory','device-cpu','device-gpu'].forEach(id => {{
+                    const el = document.getElementById(id);
+                    if (el) el.innerHTML = '<div class="no-samples">Failed to load</div>';
+                }});
             }}
         }}
         
@@ -1738,10 +2468,7 @@ def build_html():
                 const tokens = layerData.tokens;
                 const showCount = Math.max(1, tokens.length - currentMask);
                 tokens.slice(0, showCount).forEach((tokenData) => {{
-                    const similar = tokenData.similar.map(s => {{
-                        const match = s.match(/(.+)\\((.+)\\)/);
-                        return match ? match[1] : s;
-                    }}).join(',');
+                    const similar = tokenData.similar.join(',');
                     text += tokenData.inputToken + ' -> ' + similar + '\\n';
                 }});
                 text += '\\n';
@@ -1791,30 +2518,16 @@ def build_html():
         function renderGpuStats(gpus) {{
             const container = document.getElementById('gpu-content');
             if (!gpus || gpus.length === 0) {{
-                container.innerHTML = '<div class="no-gpu">No GPU detected</div>';
+                container.innerHTML = '<div class="no-gpu">No GPU</div>';
                 return;
             }}
-            container.innerHTML = gpus.map(gpu => `
-                <div class="gpu-item">
-                    <div class="gpu-name">GPU ${{gpu.index}}: ${{gpu.name}}</div>
-                    <div class="gpu-stats">
-                        <div class="gpu-stat">
-                            <div class="gpu-stat-label">Utilization</div>
-                            <div class="gpu-stat-value">${{gpu.utilization}}%</div>
-                            <div class="gpu-bar"><div class="gpu-bar-fill util" style="width: ${{gpu.utilization}}%"></div></div>
-                        </div>
-                        <div class="gpu-stat">
-                            <div class="gpu-stat-label">Memory</div>
-                            <div class="gpu-stat-value">${{gpu.memory_used}}/${{gpu.memory_total}} MB</div>
-                            <div class="gpu-bar"><div class="gpu-bar-fill mem" style="width: ${{(gpu.memory_used/gpu.memory_total*100).toFixed(1)}}%"></div></div>
-                        </div>
-                        <div class="gpu-stat">
-                            <div class="gpu-stat-label">Temp</div>
-                            <div class="gpu-stat-value">${{gpu.temperature}}°C</div>
-                        </div>
-                    </div>
-                </div>
-            `).join('');
+            container.innerHTML = gpus.map(gpu => {{
+                const memPct = gpu.memory_total > 0 ? (gpu.memory_used / gpu.memory_total * 100) : 0;
+                const barCls = memPct >= 90 ? 'danger' : (memPct >= 75 ? 'warn' : '');
+                const usedG = (gpu.memory_used / 1024).toFixed(1);
+                const totalG = (gpu.memory_total / 1024).toFixed(0);
+                return `<div class="gpu-bar-row"><span class="gpu-bar-idx">${{gpu.index}}</span><div class="gpu-bar-track"><div class="gpu-bar-fill ${{barCls}}" style="width:${{memPct}}%"></div></div><span class="gpu-bar-val">${{usedG}}/${{totalG}}G</span></div>`;
+            }}).join('');
         }}
         
         async function fetchTrainingProcesses() {{
@@ -1846,23 +2559,68 @@ def build_html():
             }} catch (error) {{ console.error('Process fetch error:', error); }}
         }}
         
+        function renderEta(eta) {{
+            const el = document.getElementById('eta-content');
+            if (!el) return;
+            if (!eta) {{
+                el.innerHTML = '<div class="eta-no-data">No Data</div>';
+                return;
+            }}
+            const pct = eta.progress.toFixed(1);
+            const stepFmt = n => n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'K' : n;
+            const tputFmt = n => n >= 1e6 ? (n/1e6).toFixed(2)+'M tok/s' : n >= 1e3 ? (n/1e3).toFixed(1)+'K tok/s' : n+' tok/s';
+            el.innerHTML = `
+                <div class="eta-progress-bar">
+                    <div class="eta-progress-fill" style="width:${{pct}}%"></div>
+                </div>
+                <div class="eta-rows">
+                    <div class="eta-row">
+                        <span class="eta-label">Progress</span>
+                        <span class="eta-value">${{pct}}%</span>
+                    </div>
+                    <div class="eta-row">
+                        <span class="eta-label">Step</span>
+                        <span class="eta-value">${{stepFmt(eta.current_step)}} / ${{stepFmt(eta.total_steps)}}</span>
+                    </div>
+                    <div class="eta-row">
+                        <span class="eta-label">Remaining</span>
+                        <span class="eta-value highlight">${{eta.eta_str}}</span>
+                    </div>
+                    <div class="eta-row">
+                        <span class="eta-label">Finish</span>
+                        <span class="eta-value">${{eta.finish_time}}</span>
+                    </div>
+                    <div class="eta-row">
+                        <span class="eta-label">Throughput</span>
+                        <span class="eta-value">${{tputFmt(eta.throughput)}}</span>
+                    </div>
+                </div>
+            `;
+        }}
+
         async function fetchCharts() {{
             try {{
                 const response = await fetch('/api/charts?ratio=' + currentRatio);
                 const data = await response.json();
-                if (data.metrics) {{
-                    document.getElementById('metrics-container').innerHTML = data.metrics.map(m => 
+                if (data.config) {{
+                    const cc = document.getElementById('config-container');
+                    if (cc) cc.innerHTML = data.config.map(m => 
                         `<div class="metric"><span class="metric-title">${{m.title}}</span><span class="metric-value">${{m.value}}</span></div>`
                     ).join('');
                 }}
-                renderGpuStats(data.gpu_stats);
-                fetchTrainingProcesses();
-                if (data.samples) {{
-                    const container = document.getElementById('samples-content');
-                    container.innerHTML = data.samples.length > 0 
-                        ? data.samples.map(s => `<div class="sample-item"><div class="sample-input">${{s.input}}</div><div class="sample-output">${{s.output}}</div></div>`).join('')
-                        : '<div class="no-samples">No samples yet</div>';
+                if (data.dataset) {{
+                    const dm = document.getElementById('dataset-metrics-container');
+                    if (dm) dm.innerHTML = data.dataset.metrics.length > 0 
+                        ? data.dataset.metrics.map(m => `<div class="metric"><span class="metric-title">${{m.title}}</span><span class="metric-value">${{m.value}}</span></div>`).join('')
+                        : '<div class="no-samples">No metrics yet</div>';
+                    const dp = document.getElementById('dataset-pie-container');
+                    if (dp) dp.innerHTML = data.dataset.pie_base64 
+                        ? `<img src="data:image/png;base64,${{data.dataset.pie_base64}}" style="max-width: 100%; max-height: 400px;" />` 
+                        : '<div class="no-samples">No metrics yet</div>';
                 }}
+                renderGpuStats(data.gpu_stats);
+                renderEta(data.eta);
+                fetchTrainingProcesses();
                 if (data.hash !== lastHash) {{
                     lastHash = data.hash;
                     data.charts.forEach((imgData, index) => {{
@@ -1875,50 +2633,129 @@ def build_html():
         
         async function fetchTrainStatus() {{
             try {{
-                // First check for existing training processes
+                const statusRes = await fetch('/api/train/status');
+                const statusData = await statusRes.json();
+                const gpuCount = Math.max(1, statusData.gpu_count || 1);
+                trainGpuCount = gpuCount;
+                renderGpuDots(gpuCount);
+                const closeResumeDropdowns = () => {{
+                    ['resume-dropdown-menu', 'resume-dropdown-menu-dataset', 'resume-dropdown-menu-config'].forEach(id => {{
+                        const m = document.getElementById(id);
+                        if (m) m.style.display = 'none';
+                    }});
+                }};
                 const procRes = await fetch('/api/train/processes');
                 const processes = await procRes.json();
+                const status = statusData.status || 'stopped';
                 
                 const el = document.getElementById('train-status');
-                const text = document.getElementById('train-status-text');
+                const badgeStatus = document.getElementById('train-status-badge');
+                const badgePid = document.getElementById('train-pid-badge');
+                const badgeUptime = document.getElementById('train-uptime-badge');
                 
-                // Get all button pairs
-                const btnStart = document.getElementById('btn-start');
-                const btnStop = document.getElementById('btn-stop');
-                const btnResume = document.getElementById('btn-resume');
-                const btnStartMetrics = document.getElementById('btn-start-metrics');
-                const btnStopMetrics = document.getElementById('btn-stop-metrics');
-                const btnResumeMetrics = document.getElementById('btn-resume-metrics');
+                const trainBtns = [
+                    document.getElementById('btn-start'), document.getElementById('btn-stop'), document.getElementById('btn-resume'),
+                    document.getElementById('btn-start-dataset'), document.getElementById('btn-stop-dataset'), document.getElementById('btn-resume-dataset'),
+                    document.getElementById('btn-start-config'), document.getElementById('btn-stop-config'), document.getElementById('btn-resume-config')
+                ];
+                const startBtns = trainBtns.filter((_, i) => i % 3 === 0);
+                const stopBtns = trainBtns.filter((_, i) => i % 3 === 1);
+                const resumeBtns = trainBtns.filter((_, i) => i % 3 === 2);
                 
                 if (processes.length > 1) {{
-                    // Multiple processes - error state
                     el.className = 'train-status running';
-                    text.textContent = 'Error: Multiple Processes';
-                    [btnStart, btnStartMetrics].forEach(b => b && (b.disabled = true));
-                    [btnStop, btnStopMetrics].forEach(b => b && (b.disabled = false));
-                    [btnResume, btnResumeMetrics].forEach(b => b && (b.disabled = true));
+                    badgeStatus.textContent = 'Status: Error';
+                    badgeStatus.style.display = '';
+                    badgePid.textContent = 'Multiple Processes';
+                    badgePid.style.display = '';
+                    badgeUptime.style.display = 'none';
+                    startBtns.forEach(b => b && (b.disabled = true));
+                    stopBtns.forEach(b => b && (b.disabled = false));
+                    resumeBtns.forEach(b => b && (b.disabled = true));
+                    closeResumeDropdowns();
                 }} else if (processes.length === 1) {{
-                    // One process - running
-                    const pid = processes[0].pid;
+                    const p = processes[0];
                     el.className = 'train-status running';
-                    text.textContent = 'Running(PID:' + pid + ')';
-                    [btnStart, btnStartMetrics].forEach(b => b && (b.disabled = true));
-                    [btnStop, btnStopMetrics].forEach(b => b && (b.disabled = false));
-                    [btnResume, btnResumeMetrics].forEach(b => b && (b.disabled = true));
+                    badgeStatus.textContent = 'Status: Running';
+                    badgeStatus.style.display = '';
+                    badgePid.textContent = 'Pid: ' + p.pid;
+                    badgePid.style.display = '';
+                    badgeUptime.textContent = p.uptime ? 'Uptime: ' + p.uptime : '';
+                    badgeUptime.style.display = p.uptime ? '' : 'none';
+                    startBtns.forEach(b => b && (b.disabled = true));
+                    stopBtns.forEach(b => b && (b.disabled = false));
+                    resumeBtns.forEach(b => b && (b.disabled = true));
+                    closeResumeDropdowns();
                 }} else {{
-                    // No processes - stopped
                     el.className = 'train-status stopped';
-                    text.textContent = 'Stopped';
-                    [btnStart, btnStartMetrics].forEach(b => b && (b.disabled = false));
-                    [btnStop, btnStopMetrics].forEach(b => b && (b.disabled = true));
-                    [btnResume, btnResumeMetrics].forEach(b => b && (b.disabled = false));
+                    badgeStatus.textContent = 'Status: Stopped';
+                    badgeStatus.style.display = '';
+                    badgePid.style.display = 'none';
+                    badgeUptime.style.display = 'none';
+                    startBtns.forEach(b => b && (b.disabled = false));
+                    stopBtns.forEach(b => b && (b.disabled = true));
+                    resumeBtns.forEach(b => b && (b.disabled = false));
                 }}
             }} catch (error) {{ console.error('Status error:', error); }}
         }}
         
+        let trainGpuCount = 8;
+        let trainGpuRangeStart = null;
+        let trainGpuRangeEnd = null;
+        function renderGpuDots(gpuCount) {{
+            const row = document.getElementById('gpu-dots-row');
+            if (!row) return;
+            const n = Math.max(1, gpuCount || 8);
+            row.innerHTML = Array.from({{ length: n }}, (_, i) => {{
+                const start = trainGpuRangeStart;
+                const end = trainGpuRangeEnd;
+                const inRange = start !== null && (end !== null ? (i >= Math.min(start,end) && i <= Math.max(start,end)) : i === start);
+                const isEnd = inRange && (end === null ? true : (i === start || i === end));
+                let cls = 'gpu-dot';
+                if (inRange) cls += ' in-range';
+                if (isEnd) cls += ' selected';
+                return `<span class="${{cls}}" data-gpu-idx="${{i}}" onclick="clickGpuDot(${{i}})">${{i}}</span>`;
+            }}).join('');
+        }}
+        function clickGpuDot(idx) {{
+            if (trainGpuRangeStart === null || (trainGpuRangeStart !== null && trainGpuRangeEnd !== null)) {{
+                trainGpuRangeStart = idx;
+                trainGpuRangeEnd = null;
+            }} else {{
+                trainGpuRangeEnd = idx;
+                if (trainGpuRangeEnd < trainGpuRangeStart) {{
+                    [trainGpuRangeStart, trainGpuRangeEnd] = [trainGpuRangeEnd, trainGpuRangeStart];
+                }}
+            }}
+            renderGpuDots(trainGpuCount);
+        }}
+        function getTrainGpuConfig() {{
+            const start = trainGpuRangeStart;
+            const end = trainGpuRangeEnd;
+            const isMulti = start !== null && end !== null && start !== end;
+            const num = isMulti ? Math.abs(end - start) + 1 : 1;
+            let gpuIds = null;
+            if (start !== null) {{
+                if (end === null || start === end) {{
+                    gpuIds = String(start);
+                }} else {{
+                    const lo = Math.min(start, end);
+                    const hi = Math.max(start, end);
+                    gpuIds = `${{lo}}-${{hi}}`;
+                }}
+            }}
+            return {{ mode: isMulti ? 'multi' : 'single', num_gpus: num, gpu_ids: gpuIds }};
+        }}
         async function startTrain() {{
             try {{
-                const response = await fetch('/api/train/start', {{ method: 'POST' }});
+                const cfg = getTrainGpuConfig();
+                const body = {{ mode: cfg.mode, num_gpus: cfg.num_gpus }};
+                if (cfg.gpu_ids) body.gpu_ids = cfg.gpu_ids;
+                const response = await fetch('/api/train/start', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify(body),
+                }});
                 const data = await response.json();
                 if (data.error) {{ showToast('Error: ' + data.error); return; }}
                 showToast('Training started');
@@ -1926,16 +2763,54 @@ def build_html():
             }} catch (error) {{ showToast('Failed to start'); }}
         }}
         
-        async function resumeTrain() {{
+        function toggleResumeDropdown(id) {{
+            const menuIds = {{ 'resume': 'resume-dropdown-menu', 'resume-dataset': 'resume-dropdown-menu-dataset', 'resume-config': 'resume-dropdown-menu-config' }};
+            const btnIds = {{ 'resume': 'btn-resume', 'resume-dataset': 'btn-resume-dataset', 'resume-config': 'btn-resume-config' }};
+            const menuId = menuIds[id] || 'resume-dropdown-menu';
+            const menu = document.getElementById(menuId);
+            const btn = document.getElementById(btnIds[id] || 'btn-resume');
+            if (btn?.disabled) return;
+            if (menu.style.display === 'block') {{ menu.style.display = 'none'; return; }}
+            fetch('/api/resume-weights').then(r => r.json()).then(data => {{
+                menu.innerHTML = '';
+                if (!data.weights || data.weights.length === 0) {{
+                    menu.innerHTML = '<div class="resume-dropdown-empty">无 .bin 文件</div>';
+                }} else {{
+                    data.weights.forEach(w => {{
+                        const item = document.createElement('button');
+                        item.className = 'resume-dropdown-item';
+                        item.textContent = w.name;
+                        item.onclick = () => {{ resumeTrain(w.name); menu.style.display = 'none'; }};
+                        menu.appendChild(item);
+                    }});
+                }}
+                menu.style.display = 'block';
+                setTimeout(() => {{
+                    const handler = (e) => {{
+                        if (!menu.parentElement.contains(e.target)) {{
+                            menu.style.display = 'none';
+                            document.removeEventListener('click', handler);
+                        }}
+                    }};
+                    document.addEventListener('click', handler);
+                }}, 0);
+            }}).catch(() => {{ menu.innerHTML = '<div class="resume-dropdown-empty">加载失败</div>'; menu.style.display = 'block'; }});
+        }}
+
+        async function resumeTrain(filename) {{
+            if (!filename) {{ showToast('请从下拉中选择文件'); return; }}
             try {{
+                const cfg = getTrainGpuConfig();
+                const body = {{ resume: filename, mode: cfg.mode, num_gpus: cfg.num_gpus }};
+                if (cfg.gpu_ids) body.gpu_ids = cfg.gpu_ids;
                 const response = await fetch('/api/train/start', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ resume: 'scholar_best.bin' }})
+                    body: JSON.stringify(body),
                 }});
                 const data = await response.json();
                 if (data.error) {{ showToast('Error: ' + data.error); return; }}
-                showToast('Training resumed from scholar_best.bin');
+                showToast('Training resumed from ' + filename);
                 fetchTrainStatus();
             }} catch (error) {{ showToast('Failed to resume'); }}
         }}
@@ -1988,7 +2863,12 @@ def build_html():
         
         async function saveAllCharts() {{
             try {{
-                const response = await fetch('/api/save_all');
+                const response = await fetch('/api/save_all?ratio=' + (currentRatio || 100));
+                if (!response.ok) {{
+                    const err = await response.json().catch(() => ({{}}));
+                    showToast(err.error || 'Failed to save');
+                    return;
+                }}
                 const blob = await response.blob();
                 const url = window.URL.createObjectURL(blob);
                 const a = document.createElement('a');
@@ -2077,7 +2957,12 @@ def build_html():
                 }});
                 const data = await response.json();
                 if (data.error) {{
-                    document.getElementById('debug-layer-container').innerHTML = `<div class="result-content" style="color: red; padding: 20px;">Error: ${{data.error}}</div>`;
+                    const esc = (s) => (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                    let errHtml = `<div class="result-content" style="color: red; padding: 20px;">
+                        <div style="font-weight: 600; margin-bottom: 8px;">Error: ${{esc(data.error)}}</div>
+                        ${{data.traceback ? `<pre style="margin: 0; padding: 12px; background: #f5f5f5; border-radius: 4px; font-size: 0.75rem; overflow: auto; max-height: 300px; white-space: pre-wrap; word-break: break-all;">${{esc(data.traceback)}}</pre>` : ''}}
+                    </div>`;
+                    document.getElementById('debug-layer-container').innerHTML = errHtml;
                 }} else {{
                     document.getElementById('debug-output-inline').style.display = 'flex';
                     document.getElementById('debug-output-text').innerHTML = `<span>${{text}}</span><span class="generated">${{data.output}}</span>`;
@@ -2244,12 +3129,30 @@ const layerId = 'layer-' + layerIndex;
             renderChat();  // Remove thinking indicator
         }}
         
+        async function refreshLogContentIfVisible() {{
+            const logTab = document.getElementById('training-tab-log');
+            if (!logTab?.classList.contains('active') || !currentLogPath) return;
+            try {{
+                const response = await fetch('/api/logs/read?name=' + encodeURIComponent(currentLogPath));
+                const data = await response.json();
+                if (data.error) return;
+                const content = document.getElementById('log-content');
+                content.textContent = data.content || '';
+                content.scrollTop = content.scrollHeight;
+                const info = document.getElementById('log-info');
+                let infoText = (data.displayed_lines || data.total_lines || 0) + ' lines';
+                if (data.truncated) infoText += ' (showing last ' + data.displayed_lines + ' of ' + data.total_lines + ')';
+                if (info) info.textContent = infoText;
+            }} catch (e) {{}}
+        }}
+        
         // Initial load
         fetchCharts();
         fetchTrainStatus();
         fetchAndRenderLayers();
         setInterval(fetchCharts, refreshInterval);
         setInterval(fetchTrainStatus, 10000);
+        setInterval(refreshLogContentIfVisible, 1000);
     </script>
 </body>
 </html>"""
@@ -2260,11 +3163,10 @@ const layerId = 'layer-' + layerIndex;
 if __name__ == "__main__":
     print(f"\n{'='*50}")
     print(f"Scholar Dashboard")
-    print(f"{'='*50}")
     print(f"  URL: http://localhost:{port}")
     print(f"  Charts: {len(charts)}")
     print(f"  Refresh: {refresh_interval}s")
+    print(f"  Press Ctrl+C to stop\n")
     print(f"{'='*50}")
-    print(f"Press Ctrl+C to stop\n")
 
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
